@@ -43,13 +43,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await file.download_to_drive(local_input)
 
     try:
-        doc = fitz.open(local_input)
+        # قراءة الملف باستخدام pypdf بشكل سليم ومتوافق
+        reader = PdfReader(local_input)
         full_text = ""
-        for page in doc:
-            t = page.get_text()
+        for page in reader.pages:
+            t = page.extract_text()
             if t:
                 full_text += t + "\n"
-        doc.close()
 
         if not full_text.strip():
             await message.reply_text("❌ لم أتمكن من العثور على نص داخل الملف. قد يكون صورة.")
