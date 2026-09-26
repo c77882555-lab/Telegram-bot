@@ -43,7 +43,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await file.download_to_drive(local_input)
 
     try:
-        # قراءة الملف باستخدام pypdf بشكل سليم ومتوافق
         reader = PdfReader(local_input)
         full_text = ""
         for page in reader.pages:
