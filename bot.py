@@ -31,10 +31,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 MODEL_NAME = "openai/gpt-oss-120b"
 
-# عدد الفقرات في كل طلب ترجمة
 BATCH_SIZE = 4
-
-# عدد محاولات إعادة الطلب عند الخطأ
 MAX_RETRIES = 5
 
 if not BOT_TOKEN:
@@ -164,7 +161,7 @@ def translate_batch(texts):
                 "Preserve medical terminology, numbers, abbreviations, "
                 "lists, and all important details. Do not summarize. "
                 "Return every block in the same order. "
-                "You MUST reproduce each block marker exactly as given, "
+                "Reproduce each block marker exactly as given, "
                 "on a separate line, followed by its Arabic translation. "
                 "Do not omit, rename, or add markers. "
                 "Do not include explanations."
@@ -181,18 +178,13 @@ def translate_batch(texts):
     if not result or not result.strip():
         raise ValueError("Groq returned an empty batch translation.")
 
-    # استخراج النص بين العلامات
-    pattern = re.compile(
-        r"<<<BLOCK_(\d+)>>>"
-    )
-
+    pattern = re.compile(r"<<<BLOCK_(\d+)>>>")
     matches = list(pattern.finditer(result))
 
     translations = {}
 
     for index, match in enumerate(matches):
         block_number = int(match.group(1))
-
         start = match.end()
 
         end = (
@@ -203,7 +195,6 @@ def translate_batch(texts):
 
         translations[block_number] = result[start:end].strip()
 
-    # إذا لم يرجع النموذج كل العلامات، نترجم الفقرات الناقصة
     output = []
 
     for i, text in enumerate(texts, start=1):
@@ -211,11 +202,9 @@ def translate_batch(texts):
 
         if not translated:
             logger.warning(
-                "Missing translation for block %s. "
-                "Retrying individually.",
+                "Missing translation for block %s. Retrying individually.",
                 i,
             )
-
             translated = translate_text(text)
 
         output.append(translated)
@@ -291,9 +280,7 @@ async def translate_document(source_path, status):
 
     completed = 0
 
-    for page_index, blocks in enumerate(
-        all_blocks, start=1
-    ):
+    for page_index, blocks in enumerate(all_blocks, start=1):
         translated_blocks = []
 
         logger.info(
@@ -320,9 +307,7 @@ async def translate_document(source_path, status):
                 english_texts,
             )
 
-            for english, arabic in zip(
-                english_texts, arabic_texts
-            ):
+            for english, arabic in zip(english_texts, arabic_texts):
                 translated_blocks.append({
                     "english": english,
                     "arabic": arabic,
@@ -344,9 +329,7 @@ async def translate_document(source_path, status):
                     f"{completed}/{total_paragraphs}"
                 )
             except Exception:
-                logger.warning(
-                    "Could not update progress message."
-                )
+                logger.warning("Could not update progress message.")
 
         translated_pages.append(translated_blocks)
 
@@ -357,10 +340,7 @@ async def translate_document(source_path, status):
 # 7. إنشاء PDF ثنائي اللغة
 # ==========================================
 
-def create_bilingual_pdf(
-    translated_pages,
-    translated_path,
-):
+def create_bilingual_pdf(translated_pages, translated_path):
     logger.info("Starting PDF creation.")
 
     writer = fitz.DocumentWriter(translated_path)
@@ -368,9 +348,7 @@ def create_bilingual_pdf(
     page_width = 595
     page_height = 842
 
-    page_rect = fitz.Rect(
-        0, 0, page_width, page_height
-    )
+    page_rect = fitz.Rect(0, 0, page_width, page_height)
 
     content_rect = fitz.Rect(
         42, 42, page_width - 42, page_height - 42
@@ -417,9 +395,7 @@ def create_bilingual_pdf(
     """
 
     try:
-        for page_number, blocks in enumerate(
-            translated_pages, start=1
-        ):
+        for page_number, blocks in enumerate(translated_pages, start=1):
             parts = []
 
             for block in blocks:
@@ -436,9 +412,7 @@ def create_bilingual_pdf(
                 )
 
             if not parts:
-                parts.append(
-                    "<p>No extractable text on this page.</p>"
-                )
+                parts.append("<p>No extractable text on this page.</p>")
 
             html_content = f"""
             <!DOCTYPE html>
@@ -466,7 +440,6 @@ def create_bilingual_pdf(
             while more:
                 generated_pages += 1
 
-                # حماية من حلقة لا نهائية
                 if generated_pages > 100:
                     raise RuntimeError(
                         f"Too many generated pages for source page "
@@ -474,33 +447,29 @@ def create_bilingual_pdf(
                     )
 
                 device = writer.begin_page(page_rect)
-                more = story.place(content_rect)
+
+                # التصحيح الأساسي: place ترجع (more, filled)
+                more, filled = story.place(content_rect)
+
                 story.draw(device)
                 writer.end_page()
 
                 logger.info(
-                    "PDF page %s: generated page %s.",
+                    "PDF source page %s: generated page %s.",
                     page_number,
                     generated_pages,
                 )
 
-            logger.info(
-                "Created translated page %s.",
-                page_number,
-            )
+            logger.info("Created translated page %s.", page_number)
 
     finally:
         writer.close()
 
     if not os.path.exists(translated_path):
-        raise FileNotFoundError(
-            "Translated PDF was not created."
-        )
+        raise FileNotFoundError("Translated PDF was not created.")
 
     if os.path.getsize(translated_path) == 0:
-        raise ValueError(
-            "Translated PDF is empty."
-        )
+        raise ValueError("Translated PDF is empty.")
 
     logger.info(
         "Translated PDF created successfully. Size: %s bytes.",
@@ -512,11 +481,7 @@ def create_bilingual_pdf(
 # 8. دمج PDF المترجم مع الأصلي
 # ==========================================
 
-def merge_pdfs(
-    translated_path,
-    source_path,
-    output_path,
-):
+def merge_pdfs(translated_path, source_path, output_path):
     logger.info("Starting PDF merge.")
 
     translated = fitz.open(translated_path)
@@ -539,14 +504,10 @@ def merge_pdfs(
         original.close()
 
     if not os.path.exists(output_path):
-        raise FileNotFoundError(
-            "Final PDF was not created."
-        )
+        raise FileNotFoundError("Final PDF was not created.")
 
     if os.path.getsize(output_path) == 0:
-        raise ValueError(
-            "Final PDF is empty."
-        )
+        raise ValueError("Final PDF is empty.")
 
     logger.info(
         "PDF merge completed. Final size: %s bytes.",
@@ -558,10 +519,7 @@ def merge_pdfs(
 # 9. أمر /start
 # ==========================================
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أهلاً بيك! 📚\n\n"
         "أرسل محاضرتك بصيغة PDF.\n\n"
@@ -575,10 +533,7 @@ async def start(
 # 10. معالجة ملفات PDF
 # ==========================================
 
-async def handle_pdf(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     document = message.document
 
@@ -588,9 +543,7 @@ async def handle_pdf(
     filename = document.file_name or "lecture.pdf"
 
     if not filename.lower().endswith(".pdf"):
-        await message.reply_text(
-            "❌ أرسل ملف PDF فقط."
-        )
+        await message.reply_text("❌ أرسل ملف PDF فقط.")
         return
 
     logger.info(
@@ -600,36 +553,20 @@ async def handle_pdf(
     )
 
     status = await message.reply_text(
-        "📥 استلمت المحاضرة!\n"
-        "جاري تجهيز الملف..."
+        "📥 استلمت المحاضرة!\nجاري تجهيز الملف..."
     )
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
-            source_path = os.path.join(
-                temp_dir, "source.pdf"
-            )
-
-            translated_path = os.path.join(
-                temp_dir, "translated.pdf"
-            )
-
-            output_path = os.path.join(
-                temp_dir, "bilingual_lecture.pdf"
-            )
+            source_path = os.path.join(temp_dir, "source.pdf")
+            translated_path = os.path.join(temp_dir, "translated.pdf")
+            output_path = os.path.join(temp_dir, "bilingual_lecture.pdf")
 
             # تنزيل الملف
-            await status.edit_text(
-                "📥 جاري تنزيل ملف PDF..."
-            )
+            await status.edit_text("📥 جاري تنزيل ملف PDF...")
 
-            tg_file = await context.bot.get_file(
-                document.file_id
-            )
-
-            await tg_file.download_to_drive(
-                source_path
-            )
+            tg_file = await context.bot.get_file(document.file_id)
+            await tg_file.download_to_drive(source_path)
 
             with fitz.open(source_path) as pdf:
                 page_count = len(pdf)
@@ -637,10 +574,7 @@ async def handle_pdf(
             if page_count == 0:
                 raise ValueError("ملف PDF فارغ.")
 
-            logger.info(
-                "Downloaded PDF: %s pages.",
-                page_count,
-            )
+            logger.info("Downloaded PDF: %s pages.", page_count)
 
             # ترجمة النصوص
             await status.edit_text(
@@ -655,8 +589,7 @@ async def handle_pdf(
 
             # إنشاء PDF المترجم
             await status.edit_text(
-                "📝 اكتملت الترجمة!\n"
-                "جاري إنشاء ملف PDF..."
+                "📝 اكتملت الترجمة!\nجاري إنشاء ملف PDF..."
             )
 
             logger.info("PDF creation started.")
@@ -700,8 +633,7 @@ async def handle_pdf(
 
             # إرسال الملف
             await status.edit_text(
-                "✅ اكتملت المعالجة!\n"
-                "جاري إرسال الملف..."
+                "✅ اكتملت المعالجة!\nجاري إرسال الملف..."
             )
 
             logger.info("Starting Telegram document upload.")
@@ -724,14 +656,10 @@ async def handle_pdf(
                 )
 
             logger.info("PDF successfully sent to user.")
-
             await status.delete()
 
     except Exception as error:
-        logger.exception(
-            "PDF processing failed: %s",
-            error,
-        )
+        logger.exception("PDF processing failed: %s", error)
 
         error_text = str(error)[:700]
 
@@ -741,19 +669,14 @@ async def handle_pdf(
                 f"{error_text}"
             )
         except Exception:
-            await message.reply_text(
-                f"❌ خطأ: {error_text}"
-            )
+            await message.reply_text(f"❌ خطأ: {error_text}")
 
 
 # ==========================================
 # 11. أمر /help
 # ==========================================
 
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📚 طريقة الاستخدام:\n\n"
         "1. أرسل ملف PDF.\n"
@@ -766,10 +689,7 @@ async def help_command(
 # 12. معالجة الأخطاء العامة
 # ==========================================
 
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(
         "Unhandled error: %s",
         context.error,
@@ -788,13 +708,8 @@ def main():
         .build()
     )
 
-    app.add_handler(
-        CommandHandler("start", start)
-    )
-
-    app.add_handler(
-        CommandHandler("help", help_command)
-    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
 
     app.add_handler(
         MessageHandler(
@@ -806,7 +721,6 @@ def main():
     app.add_error_handler(error_handler)
 
     logger.info("Bot is running...")
-
     app.run_polling()
 
 
