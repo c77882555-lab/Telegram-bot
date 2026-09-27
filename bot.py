@@ -44,7 +44,7 @@ if not GEMINI_API_KEY:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-3.5-flash"
 
 # حجم كل جزء من النص بالأحرف
 CHUNK_SIZE = 8000
