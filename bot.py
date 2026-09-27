@@ -8,7 +8,8 @@ import time
 import fitz
 import arabic_reshaper
 from bidi.algorithm import get_display
-from groq import Groq
+import argostranslate.translate
+import argostranslate.package
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -27,8 +28,7 @@ BOT_TOKEN = (
     or os.getenv("BOT_TOKEN")
     or os.getenv("TELEGRAM_BOT_TOKEN")
 )
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-MODEL_NAME = "openai/gpt-oss-120b"
+ARGOS_MODEL_PATH = os.getenv("ARGOS_MODEL_PATH", "")
 
 BATCH_SIZE = 4
 MAX_RETRIES = 5
@@ -37,11 +37,6 @@ ARABIC_FONT = os.getenv("ARABIC_FONT", "NotoNaskhArabic-Regular.ttf")
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_TOKEN (or BOT_TOKEN)")
-if not GROQ_API_KEY:
-    raise RuntimeError("Missing GROQ_API_KEY")
-
-client = Groq(api_key=GROQ_API_KEY, timeout=120.0, max_retries=0)
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -49,103 +44,54 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ==========================================
-# 2. الاتصال بـ Groq مع إعادة المحاولة
-# ==========================================
+# Install the English-to-Arabic model if it is not already present.
+def ensure_argos_model():
+    if ARGOS_MODEL_PATH and os.path.isfile(ARGOS_MODEL_PATH):
+        argostranslate.package.install_from_path(ARGOS_MODEL_PATH)
 
-def groq_request(messages):
-    for attempt in range(MAX_RETRIES):
-        try:
-            return client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=messages,
-                temperature=0.1,
-            )
-        except Exception as error:
-            status_code = getattr(error, "status_code", None)
-            if status_code == 429 or status_code in (500, 502, 503, 504):
-                wait_time = min(2 ** (attempt + 1), 30)
-                logger.warning(
-                    "Groq error %s. Retry %s/%s after %s seconds.",
-                    status_code, attempt + 1, MAX_RETRIES, wait_time,
-                )
-                if attempt == MAX_RETRIES - 1:
-                    raise
-                time.sleep(wait_time)
-            else:
-                raise
-    raise RuntimeError("Groq request failed after retries.")
+    installed = argostranslate.translate.get_installed_languages()
+    en = next((lang for lang in installed if lang.code == "en"), None)
+    if en and any(t.to_lang.code == "ar" for t in en.translations):
+        return
+
+    # Download the free open-source language package automatically.
+    argostranslate.package.update_package_index()
+    packages = argostranslate.package.get_available_packages()
+    package = next((p for p in packages if p.from_code == "en" and p.to_code == "ar"), None)
+    if package is None:
+        raise RuntimeError("Argos model en→ar is not available in the package index.")
+    downloaded = package.download()
+    argostranslate.package.install_from_path(downloaded)
+    logger.info("Installed Argos English-to-Arabic translation model.")
+
+try:
+    ensure_argos_model()
+except Exception as exc:
+    logger.warning("Argos model setup failed; translation will report the issue: %s", exc)
 
 
 # ==========================================
-# 3. الترجمة
+# 2. الترجمة محلياً باستخدام Argos Translate
 # ==========================================
 
 def translate_text(text: str) -> str:
     if not text.strip():
         return ""
-    response = groq_request([
-        {
-            "role": "system",
-            "content": (
-                "You are a professional translator. Translate the English text "
-                "into accurate, clear Arabic. Preserve technical/medical terms, "
-                "numbers, abbreviations, lists, and all details. Do not summarize. "
-                "Return only the Arabic translation."
-            ),
-        },
-        {"role": "user", "content": text},
-    ])
-    result = response.choices[0].message.content
+    try:
+        result = argostranslate.translate.translate(text, "en", "ar")
+    except Exception as exc:
+        raise RuntimeError(
+            "نموذج Argos للترجمة من الإنجليزية إلى العربية غير مثبت. "
+            "ثبّت نموذج en→ar على السيرفر أولاً."
+        ) from exc
     if not result or not result.strip():
-        raise ValueError("Groq returned an empty translation.")
+        raise ValueError("Argos returned an empty translation.")
     return result.strip()
 
 
 def translate_batch(texts):
-    if not texts:
-        return []
-    if len(texts) == 1:
-        return [translate_text(texts[0])]
-
-    markers = [f"<<<BLOCK_{i}>>>" for i in range(1, len(texts) + 1)]
-    combined_text = "\n\n".join(
-        f"{markers[i]}\n{text}" for i, text in enumerate(texts)
-    )
-    response = groq_request([
-        {
-            "role": "system",
-            "content": (
-                "Translate each English block into accurate Arabic. Preserve "
-                "terminology, numbers, abbreviations, lists, and all details. "
-                "Return every block in the same order. Reproduce each marker "
-                "exactly on a separate line, followed by its Arabic translation. "
-                "Do not omit or add markers and do not include explanations."
-            ),
-        },
-        {"role": "user", "content": combined_text},
-    ])
-    result = response.choices[0].message.content
-    if not result or not result.strip():
-        raise ValueError("Groq returned an empty batch translation.")
-
-    pattern = re.compile(r"<<<BLOCK_(\d+)>>>")
-    matches = list(pattern.finditer(result))
-    translations = {}
-    for index, match in enumerate(matches):
-        block_number = int(match.group(1))
-        start = match.end()
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(result)
-        translations[block_number] = result[start:end].strip()
-
-    output = []
-    for i, text in enumerate(texts, start=1):
-        translated = translations.get(i, "")
-        if not translated:
-            logger.warning("Missing translation for block %s; retrying individually.", i)
-            translated = translate_text(text)
-        output.append(translated)
-    return output
+    # Argos works locally; translate each paragraph without any API quota.
+    return [translate_text(text) for text in texts]
 
 
 # ==========================================
@@ -282,11 +228,11 @@ def create_bilingual_pdf(source_path, translated_pages, translated_path):
             raise ValueError("عدد الصفحات الأصلية لا يطابق عدد صفحات الترجمة.")
 
         font = fitz.Font(fontfile=ARABIC_FONT)
-        font_size = 14.0
+        font_size = 18.0
         margin_x = 28
         gap_before_translation = 3
         gap_after_translation = 8
-        line_height = font_size * 1.8
+        line_height = font_size * 1.9
 
         def wrap_arabic(text, max_width):
             words = (text or "").split()
@@ -541,10 +487,11 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as error:
         logger.exception("PDF processing failed: %s", error)
         error_text = str(error)[:700]
+        user_error = "❌ صار خطأ أثناء معالجة الملف:\n\n" + error_text
         try:
-            await status.edit_text("❌ صار خطأ أثناء معالجة الملف:\n\n" + error_text)
+            await status.edit_text(user_error)
         except Exception:
-            await message.reply_text(f"❌ خطأ: {error_text}")
+            await message.reply_text(user_error)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
