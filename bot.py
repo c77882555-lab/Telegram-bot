@@ -20,7 +20,8 @@ from telegram.ext import (
 # ==========================================
 
 BOT_TOKEN = (
-    os.getenv("BOT_TOKEN")
+    os.getenv("TELEGRAM_TOKEN")
+    or os.getenv("BOT_TOKEN")
     or os.getenv("TELEGRAM_BOT_TOKEN")
 )
 
@@ -30,12 +31,12 @@ MODEL_NAME = "openai/gpt-oss-120b"
 
 if not BOT_TOKEN:
     raise RuntimeError(
-        "Missing bot token. Set BOT_TOKEN or TELEGRAM_BOT_TOKEN in Render."
+        "Missing TELEGRAM_TOKEN. Check Render Environment Variables."
     )
 
 if not GROQ_API_KEY:
     raise RuntimeError(
-        "Missing GROQ_API_KEY. Add it to Render Environment Variables."
+        "Missing GROQ_API_KEY. Check Render Environment Variables."
     )
 
 client = Groq(api_key=GROQ_API_KEY)
@@ -129,7 +130,6 @@ def make_bilingual_html(blocks, page_number):
     for index, block in enumerate(blocks, start=1):
         english_text = block["text"]
 
-        # ترجمة كل فقرة بشكل مستقل
         arabic_text = translate_text(english_text)
 
         english = html.escape(english_text)
@@ -257,11 +257,8 @@ def create_bilingual_pdf(source_path, translated_path):
 
             while more:
                 device = writer.begin_page(page_rect)
-
                 more = story.place(content_rect)
-
                 story.draw(device)
-
                 writer.end_page()
 
     finally:
@@ -279,10 +276,7 @@ def merge_pdfs(translated_path, source_path, output_path):
     output = fitz.open()
 
     try:
-        # صفحات الترجمة أولاً
         output.insert_pdf(translated)
-
-        # صفحات المحاضرة الأصلية بعدها
         output.insert_pdf(original)
 
         output.save(
@@ -355,7 +349,6 @@ async def handle_pdf(
                 temp_dir, "bilingual_lecture.pdf"
             )
 
-            # تحميل الملف
             tg_file = await context.bot.get_file(
                 document.file_id
             )
@@ -364,7 +357,6 @@ async def handle_pdf(
                 source_path
             )
 
-            # فحص الملف
             with fitz.open(source_path) as pdf:
                 page_count = len(pdf)
 
@@ -379,14 +371,12 @@ async def handle_pdf(
                 "جاري استخراج النصوص وترجمتها..."
             )
 
-            # إنشاء صفحات الترجمة
             await asyncio.to_thread(
                 create_bilingual_pdf,
                 source_path,
                 translated_path,
             )
 
-            # دمج صفحات الترجمة والأصل
             await asyncio.to_thread(
                 merge_pdfs,
                 translated_path,
