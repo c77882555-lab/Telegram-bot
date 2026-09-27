@@ -15,31 +15,44 @@ from telegram.ext import (
     filters,
 )
 
-# =========================
-# إعدادات البوت
-# =========================
+# ==========================================
+# 1. إعدادات البوت
+# ==========================================
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+BOT_TOKEN = (
+    os.getenv("BOT_TOKEN")
+    or os.getenv("TELEGRAM_BOT_TOKEN")
+)
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 MODEL_NAME = "openai/gpt-oss-120b"
+
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "Missing bot token. Set BOT_TOKEN or TELEGRAM_BOT_TOKEN in Render."
+    )
+
+if not GROQ_API_KEY:
+    raise RuntimeError(
+        "Missing GROQ_API_KEY. Add it to Render Environment Variables."
+    )
 
 client = Groq(api_key=GROQ_API_KEY)
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
+
 logger = logging.getLogger(__name__)
 
 
-# =========================
-# الترجمة عبر Groq
-# =========================
+# ==========================================
+# 2. ترجمة النص باستخدام Groq
+# ==========================================
 
 def translate_text(text: str) -> str:
-    """ترجمة فقرة إنكليزية إلى العربية."""
-
     if not text.strip():
         return ""
 
@@ -49,11 +62,11 @@ def translate_text(text: str) -> str:
             {
                 "role": "system",
                 "content": (
-                    "You are a professional medical lecture translator. "
-                    "Translate the provided English text into accurate, "
-                    "clear Arabic. Preserve medical terminology and all "
-                    "important details, numbers, abbreviations, and lists. "
-                    "Do not summarize, omit, or add explanations. "
+                    "You are a professional medical translator. "
+                    "Translate the English text into accurate, clear Arabic. "
+                    "Preserve medical terminology, numbers, abbreviations, "
+                    "lists, and all important details. "
+                    "Do not summarize or omit anything. "
                     "Return only the Arabic translation."
                 ),
             },
@@ -65,30 +78,34 @@ def translate_text(text: str) -> str:
         temperature=0.1,
     )
 
-    return response.choices[0].message.content.strip()
+    result = response.choices[0].message.content
+
+    if not result:
+        raise ValueError("Groq returned an empty translation.")
+
+    return result.strip()
 
 
-# =========================
-# استخراج فقرات الصفحة
-# =========================
+# ==========================================
+# 3. استخراج النصوص من صفحات PDF
+# ==========================================
 
 def extract_blocks(page):
-    """استخراج النصوص وترتيبها من الأعلى إلى الأسفل."""
-
     blocks = page.get_text("blocks", sort=True)
     result = []
 
     for block in blocks:
+        if len(block) < 5:
+            continue
+
         x0, y0, x1, y1, text = block[:5]
 
-        # تجاهل كتل الصور والكتل الفارغة
-        if not isinstance(text, str) or not text.strip():
+        if not isinstance(text, str):
             continue
 
         text = text.strip()
 
-        # تجاهل النصوص القصيرة جداً التي غالباً تكون أرقام صفحات
-        if len(text) < 2:
+        if not text:
             continue
 
         result.append({
@@ -102,20 +119,21 @@ def extract_blocks(page):
     return result
 
 
-# =========================
-# إنشاء HTML ثنائي اللغة
-# =========================
+# ==========================================
+# 4. إنشاء HTML ثنائي اللغة
+# ==========================================
 
-def make_bilingual_html(blocks):
-    """الإنكليزي بالأسود والترجمة العربية بالأحمر تحته."""
-
+def make_bilingual_html(blocks, page_number):
     parts = []
 
-    for block in blocks:
-        english = html.escape(block["text"])
+    for index, block in enumerate(blocks, start=1):
+        english_text = block["text"]
 
-        arabic = translate_text(block["text"])
-        arabic = html.escape(arabic)
+        # ترجمة كل فقرة بشكل مستقل
+        arabic_text = translate_text(english_text)
+
+        english = html.escape(english_text)
+        arabic = html.escape(arabic_text)
 
         parts.append(
             f"""
@@ -126,6 +144,13 @@ def make_bilingual_html(blocks):
             """
         )
 
+        logger.info(
+            "Page %s: translated paragraph %s/%s",
+            page_number,
+            index,
+            len(blocks),
+        )
+
     return f"""
     <!DOCTYPE html>
     <html>
@@ -133,35 +158,39 @@ def make_bilingual_html(blocks):
         <meta charset="utf-8">
     </head>
     <body>
-        <h1 class="heading">Bilingual Lecture / المحاضرة المترجمة</h1>
+        <h1 class="heading">
+            Lecture Translation - Page {page_number}
+        </h1>
         {''.join(parts)}
     </body>
     </html>
     """
 
 
-# =========================
-# إنشاء صفحات الترجمة
-# =========================
+# ==========================================
+# 5. إنشاء PDF مترجم
+# ==========================================
 
 def create_bilingual_pdf(source_path, translated_path):
-    """إنشاء صفحات ثنائية اللغة مع تقسيم تلقائي للصفحات."""
-
     source = fitz.open(source_path)
-
     writer = fitz.DocumentWriter(translated_path)
 
     page_width = 595
     page_height = 842
 
-    page_rect = fitz.Rect(0, 0, page_width, page_height)
-    content_rect = fitz.Rect(42, 42, page_width - 42, page_height - 42)
+    page_rect = fitz.Rect(
+        0, 0, page_width, page_height
+    )
+
+    content_rect = fitz.Rect(
+        42, 42, page_width - 42, page_height - 42
+    )
 
     css = """
     body {
         font-family: sans-serif;
         font-size: 11pt;
-        line-height: 1.45;
+        line-height: 1.5;
         color: #111111;
     }
 
@@ -174,7 +203,7 @@ def create_bilingual_pdf(source_path, translated_path):
 
     .paragraph {
         margin-bottom: 18pt;
-        padding-bottom: 8pt;
+        padding-bottom: 10pt;
         border-bottom: 0.5pt solid #dddddd;
     }
 
@@ -198,13 +227,26 @@ def create_bilingual_pdf(source_path, translated_path):
     """
 
     try:
+        total_pages = len(source)
+
         for page_number, page in enumerate(source, start=1):
             blocks = extract_blocks(page)
 
             if not blocks:
-                blocks = [{"text": "(No extractable text on this page)"}]
+                blocks = [{
+                    "text": "No extractable text on this page."
+                }]
 
-            html_content = make_bilingual_html(blocks)
+            logger.info(
+                "Processing page %s/%s",
+                page_number,
+                total_pages,
+            )
+
+            html_content = make_bilingual_html(
+                blocks,
+                page_number,
+            )
 
             story = fitz.Story(
                 html=html_content,
@@ -215,55 +257,66 @@ def create_bilingual_pdf(source_path, translated_path):
 
             while more:
                 device = writer.begin_page(page_rect)
-                more = story.place(content_rect)
-                story.draw(device)
-                writer.end_page()
 
-            logger.info(
-                "Translated page %s of %s",
-                page_number,
-                len(source),
-            )
+                more = story.place(content_rect)
+
+                story.draw(device)
+
+                writer.end_page()
 
     finally:
         writer.close()
         source.close()
 
 
-# =========================
-# دمج الترجمة مع الأصل
-# =========================
+# ==========================================
+# 6. دمج الترجمة مع صفحات المحاضرة الأصلية
+# ==========================================
 
 def merge_pdfs(translated_path, source_path, output_path):
-    """صفحات الترجمة أولاً ثم صفحات المحاضرة الأصلية."""
-
     translated = fitz.open(translated_path)
     original = fitz.open(source_path)
     output = fitz.open()
 
-    output.insert_pdf(translated)
-    output.insert_pdf(original)
+    try:
+        # صفحات الترجمة أولاً
+        output.insert_pdf(translated)
 
-    output.save(output_path, garbage=4, deflate=True)
+        # صفحات المحاضرة الأصلية بعدها
+        output.insert_pdf(original)
 
-    output.close()
-    translated.close()
-    original.close()
+        output.save(
+            output_path,
+            garbage=4,
+            deflate=True,
+        )
+
+    finally:
+        output.close()
+        translated.close()
+        original.close()
 
 
-# =========================
-# أوامر البوت
-# =========================
+# ==========================================
+# 7. أمر /start
+# ==========================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     await update.message.reply_text(
         "أهلاً بيك! 📚\n\n"
-        "أرسل ملف محاضرة بصيغة PDF.\n"
-        "راح أترجم النص الإنكليزي إلى العربية، "
-        "وأضع الترجمة الحمراء تحت كل فقرة إنكليزية، "
+        "أرسل محاضرتك بصيغة PDF.\n\n"
+        "راح أرتب النص الإنكليزي بالأسود، "
+        "والترجمة العربية بالأحمر تحته مباشرةً، "
         "وبعدها أرفق صفحات المحاضرة الأصلية."
     )
 
+
+# ==========================================
+# 8. معالجة ملفات PDF
+# ==========================================
 
 async def handle_pdf(
     update: Update,
@@ -272,31 +325,53 @@ async def handle_pdf(
     message = update.message
     document = message.document
 
-    if not document or not document.file_name.lower().endswith(".pdf"):
-        await message.reply_text("أرسل ملف PDF فقط.")
+    if not document:
+        return
+
+    filename = document.file_name or "lecture.pdf"
+
+    if not filename.lower().endswith(".pdf"):
+        await message.reply_text(
+            "❌ أرسل ملف PDF فقط."
+        )
         return
 
     status = await message.reply_text(
-        "📥 استلمت المحاضرة، دا أجهزها وأترجمها...\n"
-        "قد يستغرق هذا بعض الوقت حسب عدد الصفحات."
+        "📥 استلمت المحاضرة!\n"
+        "جاري تجهيز الملف والترجمة..."
     )
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
-            source_path = os.path.join(temp_dir, "source.pdf")
-            translated_path = os.path.join(temp_dir, "translated.pdf")
-            output_path = os.path.join(temp_dir, "bilingual_lecture.pdf")
+            source_path = os.path.join(
+                temp_dir, "source.pdf"
+            )
 
-            tg_file = await context.bot.get_file(document.file_id)
-            await tg_file.download_to_drive(source_path)
+            translated_path = os.path.join(
+                temp_dir, "translated.pdf"
+            )
+
+            output_path = os.path.join(
+                temp_dir, "bilingual_lecture.pdf"
+            )
+
+            # تحميل الملف
+            tg_file = await context.bot.get_file(
+                document.file_id
+            )
+
+            await tg_file.download_to_drive(
+                source_path
+            )
 
             # فحص الملف
-            pdf = fitz.open(source_path)
-            page_count = len(pdf)
-            pdf.close()
+            with fitz.open(source_path) as pdf:
+                page_count = len(pdf)
 
             if page_count == 0:
-                await status.edit_text("الملف فارغ.")
+                await status.edit_text(
+                    "❌ الملف فارغ."
+                )
                 return
 
             await status.edit_text(
@@ -304,13 +379,14 @@ async def handle_pdf(
                 "جاري استخراج النصوص وترجمتها..."
             )
 
-            # تشغيل المعالجة الثقيلة خارج حلقة البوت
+            # إنشاء صفحات الترجمة
             await asyncio.to_thread(
                 create_bilingual_pdf,
                 source_path,
                 translated_path,
             )
 
+            # دمج صفحات الترجمة والأصل
             await asyncio.to_thread(
                 merge_pdfs,
                 translated_path,
@@ -318,50 +394,75 @@ async def handle_pdf(
                 output_path,
             )
 
-            await status.edit_text("📤 اكتملت الترجمة، جاري إرسال الملف...")
+            await status.edit_text(
+                "✅ اكتملت المعالجة، جاري إرسال الملف..."
+            )
 
             with open(output_path, "rb") as file:
                 await message.reply_document(
                     document=file,
                     filename="Bilingual_Lecture.pdf",
                     caption=(
-                        "✅ اكتملت المحاضرة!\n\n"
-                        "الإنكليزي بالأسود، والترجمة العربية بالأحمر، "
-                        "وصفحات المحاضرة الأصلية مرفقة في نهاية الملف."
+                        "✅ تمت معالجة المحاضرة!\n\n"
+                        "الإنكليزي بالأسود، "
+                        "والترجمة العربية بالأحمر تحته، "
+                        "وصفحات المحاضرة الأصلية مرفقة بالنهاية."
                     ),
                 )
 
             await status.delete()
 
-    except Exception as e:
+    except Exception as error:
         logger.exception("PDF processing failed")
-        await status.edit_text(
-            "❌ صار خطأ أثناء معالجة الملف.\n"
-            f"التفاصيل: {str(e)[:800]}"
-        )
 
+        error_text = str(error)[:700]
+
+        try:
+            await status.edit_text(
+                "❌ صار خطأ أثناء معالجة الملف:\n\n"
+                f"{error_text}"
+            )
+        except Exception:
+            await message.reply_text(
+                f"❌ خطأ: {error_text}"
+            )
+
+
+# ==========================================
+# 9. أمر /help
+# ==========================================
 
 async def help_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
     await update.message.reply_text(
-        "طريقة الاستخدام:\n"
+        "📚 طريقة الاستخدام:\n\n"
         "1. أرسل ملف PDF.\n"
         "2. انتظر اكتمال الترجمة.\n"
-        "3. استلم الملف الثنائي اللغة."
+        "3. استلم ملف المحاضرة المترجم."
     )
 
 
-# =========================
-# تشغيل البوت
-# =========================
+# ==========================================
+# 10. تشغيل البوت
+# ==========================================
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(
+        CommandHandler("start", start)
+    )
+
+    app.add_handler(
+        CommandHandler("help", help_command)
+    )
+
     app.add_handler(
         MessageHandler(
             filters.Document.ALL,
@@ -370,6 +471,7 @@ def main():
     )
 
     logger.info("Bot is running...")
+
     app.run_polling()
 
 
