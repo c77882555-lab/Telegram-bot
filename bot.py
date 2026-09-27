@@ -282,11 +282,11 @@ def create_bilingual_pdf(source_path, translated_pages, translated_path):
             raise ValueError("عدد الصفحات الأصلية لا يطابق عدد صفحات الترجمة.")
 
         font = fitz.Font(fontfile=ARABIC_FONT)
-        font_size = 10.5
+        font_size = 14.0
         margin_x = 28
         gap_before_translation = 3
         gap_after_translation = 8
-        line_height = font_size * 1.65
+        line_height = font_size * 1.8
 
         def wrap_arabic(text, max_width):
             words = (text or "").split()
