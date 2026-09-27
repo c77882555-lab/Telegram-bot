@@ -8,8 +8,7 @@ import time
 import fitz
 import arabic_reshaper
 from bidi.algorithm import get_display
-import argostranslate.translate
-import argostranslate.package
+from deep_translator import GoogleTranslator
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -28,15 +27,14 @@ BOT_TOKEN = (
     or os.getenv("BOT_TOKEN")
     or os.getenv("TELEGRAM_BOT_TOKEN")
 )
-ARGOS_MODEL_PATH = os.getenv("ARGOS_MODEL_PATH", "")
-
 BATCH_SIZE = 4
-MAX_RETRIES = 5
+MAX_RETRIES = 4
 
 ARABIC_FONT = os.getenv("ARABIC_FONT", "NotoNaskhArabic-Regular.ttf")
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_TOKEN (or BOT_TOKEN)")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -44,53 +42,38 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# Install the English-to-Arabic model if it is not already present.
-def ensure_argos_model():
-    if ARGOS_MODEL_PATH and os.path.isfile(ARGOS_MODEL_PATH):
-        argostranslate.package.install_from_path(ARGOS_MODEL_PATH)
-
-    installed = argostranslate.translate.get_installed_languages()
-    en = next((lang for lang in installed if lang.code == "en"), None)
-    if en and any(t.to_lang.code == "ar" for t in en.translations):
-        return
-
-    # Download the free open-source language package automatically.
-    argostranslate.package.update_package_index()
-    packages = argostranslate.package.get_available_packages()
-    package = next((p for p in packages if p.from_code == "en" and p.to_code == "ar"), None)
-    if package is None:
-        raise RuntimeError("Argos model en→ar is not available in the package index.")
-    downloaded = package.download()
-    argostranslate.package.install_from_path(downloaded)
-    logger.info("Installed Argos English-to-Arabic translation model.")
-
-try:
-    ensure_argos_model()
-except Exception as exc:
-    logger.warning("Argos model setup failed; translation will report the issue: %s", exc)
-
-
 # ==========================================
-# 2. الترجمة محلياً باستخدام Argos Translate
+# 2. الترجمة عبر Google Translate (deep-translator)
 # ==========================================
 
 def translate_text(text: str) -> str:
-    if not text.strip():
+    text = (text or "").strip()
+    if not text:
         return ""
-    try:
-        result = argostranslate.translate.translate(text, "en", "ar")
-    except Exception as exc:
-        raise RuntimeError(
-            "نموذج Argos للترجمة من الإنجليزية إلى العربية غير مثبت. "
-            "ثبّت نموذج en→ar على السيرفر أولاً."
-        ) from exc
-    if not result or not result.strip():
-        raise ValueError("Argos returned an empty translation.")
-    return result.strip()
+
+    # Google Translate through the unofficial deep-translator library.
+    # No API key is required, but Google may throttle or block frequent requests.
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            result = GoogleTranslator(source="auto", target="ar").translate(text)
+            if not result or not result.strip():
+                raise ValueError("Google Translate returned an empty translation.")
+            return result.strip()
+        except Exception as error:
+            last_error = error
+            wait_time = min(2 ** attempt, 12)
+            logger.warning(
+                "Google Translate failed (attempt %s/%s): %s",
+                attempt + 1, MAX_RETRIES, error,
+            )
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(wait_time)
+    raise RuntimeError(f"Google Translate failed after retries: {last_error}")
 
 
 def translate_batch(texts):
-    # Argos works locally; translate each paragraph without any API quota.
+    # Translate each paragraph separately to preserve exact paragraph alignment.
     return [translate_text(text) for text in texts]
 
 
@@ -487,7 +470,10 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as error:
         logger.exception("PDF processing failed: %s", error)
         error_text = str(error)[:700]
-        user_error = "❌ صار خطأ أثناء معالجة الملف:\n\n" + error_text
+        user_error = (
+            "❌ صار خطأ أثناء الترجمة أو معالجة الملف. ممكن Google Translate "
+            "قيّد الطلبات مؤقتاً؛ انتظر شوي وجرب مرة ثانية.\n\n" + error_text
+        )
         try:
             await status.edit_text(user_error)
         except Exception:
