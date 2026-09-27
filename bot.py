@@ -4,7 +4,6 @@ import asyncio
 import tempfile
 import logging
 import time
-import textwrap
 
 import fitz
 import arabic_reshaper
@@ -35,14 +34,13 @@ MODEL_NAME = "openai/gpt-oss-120b"
 BATCH_SIZE = 4
 MAX_RETRIES = 5
 
-# خط عربي: تقدر تحدد مساره بمتغير ARABIC_FONT
 ARABIC_FONT = os.getenv(
     "ARABIC_FONT",
     "NotoNaskhArabic-Regular.ttf",
 )
 
 if not BOT_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_TOKEN")
+    raise RuntimeError("Missing TELEGRAM_TOKEN (or BOT_TOKEN)")
 
 if not GROQ_API_KEY:
     raise RuntimeError("Missing GROQ_API_KEY")
@@ -57,7 +55,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
-
 logger = logging.getLogger(__name__)
 
 
@@ -73,28 +70,18 @@ def groq_request(messages):
                 messages=messages,
                 temperature=0.1,
             )
-
         except Exception as error:
             status_code = getattr(error, "status_code", None)
 
-            if status_code == 429 or status_code in (
-                500, 502, 503, 504
-            ):
+            if status_code == 429 or status_code in (500, 502, 503, 504):
                 wait_time = min(2 ** (attempt + 1), 30)
-
                 logger.warning(
                     "Groq error %s. Retry %s/%s after %s seconds.",
-                    status_code,
-                    attempt + 1,
-                    MAX_RETRIES,
-                    wait_time,
+                    status_code, attempt + 1, MAX_RETRIES, wait_time,
                 )
-
                 if attempt == MAX_RETRIES - 1:
                     raise
-
                 time.sleep(wait_time)
-
             else:
                 raise
 
@@ -121,17 +108,12 @@ def translate_text(text: str) -> str:
                 "Return only the Arabic translation."
             ),
         },
-        {
-            "role": "user",
-            "content": text,
-        },
+        {"role": "user", "content": text},
     ])
 
     result = response.choices[0].message.content
-
     if not result or not result.strip():
         raise ValueError("Groq returned an empty translation.")
-
     return result.strip()
 
 
@@ -142,18 +124,12 @@ def translate_text(text: str) -> str:
 def translate_batch(texts):
     if not texts:
         return []
-
     if len(texts) == 1:
         return [translate_text(texts[0])]
 
-    markers = [
-        f"<<<BLOCK_{i}>>>"
-        for i in range(1, len(texts) + 1)
-    ]
-
+    markers = [f"<<<BLOCK_{i}>>>" for i in range(1, len(texts) + 1)]
     combined_text = "\n\n".join(
-        f"{markers[i]}\n{text}"
-        for i, text in enumerate(texts)
+        f"{markers[i]}\n{text}" for i, text in enumerate(texts)
     )
 
     response = groq_request([
@@ -171,48 +147,32 @@ def translate_batch(texts):
                 "Do not include explanations."
             ),
         },
-        {
-            "role": "user",
-            "content": combined_text,
-        },
+        {"role": "user", "content": combined_text},
     ])
 
     result = response.choices[0].message.content
-
     if not result or not result.strip():
         raise ValueError("Groq returned an empty batch translation.")
 
     pattern = re.compile(r"<<<BLOCK_(\d+)>>>")
     matches = list(pattern.finditer(result))
-
     translations = {}
 
     for index, match in enumerate(matches):
         block_number = int(match.group(1))
         start = match.end()
-
-        end = (
-            matches[index + 1].start()
-            if index + 1 < len(matches)
-            else len(result)
-        )
-
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(result)
         translations[block_number] = result[start:end].strip()
 
     output = []
-
     for i, text in enumerate(texts, start=1):
         translated = translations.get(i, "")
-
         if not translated:
             logger.warning(
-                "Missing translation for block %s. Retrying individually.",
-                i,
+                "Missing translation for block %s. Retrying individually.", i
             )
             translated = translate_text(text)
-
         output.append(translated)
-
     return output
 
 
@@ -223,23 +183,15 @@ def translate_batch(texts):
 def extract_blocks(page):
     blocks = page.get_text("blocks", sort=True)
     result = []
-
     for block in blocks:
         if len(block) < 5:
             continue
-
         text = block[4]
-
         if not isinstance(text, str):
             continue
-
         text = text.strip()
-
-        if not text:
-            continue
-
-        result.append({"text": text})
-
+        if text:
+            result.append({"text": text})
     return result
 
 
@@ -252,19 +204,11 @@ async def translate_document(source_path, status):
 
     with fitz.open(source_path) as pdf:
         total_pages = len(pdf)
-
         if total_pages == 0:
             raise ValueError("ملف PDF فارغ.")
+        all_blocks = [extract_blocks(page) for page in pdf]
 
-        all_blocks = [
-            extract_blocks(page)
-            for page in pdf
-        ]
-
-    total_paragraphs = sum(
-        len(blocks) for blocks in all_blocks
-    )
-
+    total_paragraphs = sum(len(blocks) for blocks in all_blocks)
     if total_paragraphs == 0:
         raise ValueError(
             "ما لكيت نص قابل للاستخراج من الملف. "
@@ -272,38 +216,27 @@ async def translate_document(source_path, status):
         )
 
     completed = 0
-
     for page_index, blocks in enumerate(all_blocks, start=1):
         translated_blocks = []
 
         for start in range(0, len(blocks), BATCH_SIZE):
             batch = blocks[start:start + BATCH_SIZE]
+            english_texts = [block["text"] for block in batch]
 
-            english_texts = [
-                block["text"] for block in batch
-            ]
+            arabic_texts = await asyncio.to_thread(translate_batch, english_texts)
 
-            arabic_texts = await asyncio.to_thread(
-                translate_batch,
-                english_texts,
-            )
-
-            for english, arabic in zip(
-                english_texts, arabic_texts
-            ):
+            for english, arabic in zip(english_texts, arabic_texts):
                 translated_blocks.append({
                     "english": english,
                     "arabic": arabic,
                 })
 
             completed += len(batch)
-
             try:
                 await status.edit_text(
                     "🌐 جاري ترجمة المحاضرة...\n\n"
                     f"📄 الصفحة: {page_index}/{total_pages}\n"
-                    f"📝 الفقرات المترجمة: "
-                    f"{completed}/{total_paragraphs}"
+                    f"📝 الفقرات المترجمة: {completed}/{total_paragraphs}"
                 )
             except Exception:
                 logger.warning("Could not update progress message.")
@@ -320,24 +253,27 @@ async def translate_document(source_path, status):
 def prepare_arabic(text):
     """تشكيل الحروف العربية وضبط اتجاه الكتابة."""
     text = text.strip()
-
     if not text:
         return ""
-
-    reshaped = arabic_reshaper.reshape(text)
-    return get_display(reshaped)
+    return get_display(arabic_reshaper.reshape(text))
 
 
-def wrap_arabic(text, max_chars=65):
-    """تقسيم النص العربي إلى أسطر قبل إدراجه."""
+def wrap_arabic_by_width(text, font, fontsize, max_width):
+    """تقسيم العربية إلى أسطر بحسب العرض الفعلي للخط."""
     words = text.split()
     lines = []
     current = ""
 
     for word in words:
         candidate = f"{current} {word}".strip()
+        shaped_candidate = prepare_arabic(candidate)
 
-        if len(candidate) <= max_chars:
+        try:
+            candidate_width = font.text_length(shaped_candidate, fontsize=fontsize)
+        except Exception:
+            candidate_width = len(candidate) * fontsize * 0.65
+
+        if candidate_width <= max_width:
             current = candidate
         else:
             if current:
@@ -351,22 +287,16 @@ def wrap_arabic(text, max_chars=65):
 
 
 # ==========================================
-# 8. إنشاء PDF مع الحفاظ على الصفحات الأصلية
+# 8. إنشاء PDF ثنائي اللغة مع الحفاظ على الأصل
 # ==========================================
 
-def create_bilingual_pdf(
-    source_path,
-    translated_pages,
-    translated_path,
-):
+def create_bilingual_pdf(source_path, translated_pages, translated_path):
     logger.info("Starting bilingual PDF creation.")
 
     if not os.path.exists(ARABIC_FONT):
         raise FileNotFoundError(
-            "خط العربية غير موجود: "
-            f"{ARABIC_FONT}\n"
-            "أضف ملف NotoNaskhArabic-Regular.ttf "
-            "إلى مجلد البوت أو عيّن ARABIC_FONT."
+            f"خط العربية غير موجود: {ARABIC_FONT}\n"
+            "تأكد من وجود ملف الخط داخل مجلد البوت أو عيّن ARABIC_FONT."
         )
 
     output = fitz.open()
@@ -374,146 +304,93 @@ def create_bilingual_pdf(
 
     try:
         if len(original) != len(translated_pages):
-            raise ValueError(
-                "عدد الصفحات الأصلية لا يطابق عدد صفحات الترجمة."
-            )
+            raise ValueError("عدد الصفحات الأصلية لا يطابق عدد صفحات الترجمة.")
 
         for page_index, source_page in enumerate(original):
             blocks = translated_pages[page_index]
-
             width = source_page.rect.width
             original_height = source_page.rect.height
 
             margin = 36
-            font_size = 12
-            line_height = 22
-            paragraph_gap = 14
-            title_height = 40
+            font_size = 11
+            line_height = 20
+            paragraph_gap = 12
+            title_height = 34
+            usable_width = width - 2 * margin
+
+            # إنشاء صفحة مؤقتة لتسجيل الخط وقياس النص بدقة
+            temp_doc = fitz.open()
+            temp_page = temp_doc.new_page(width=width, height=100)
+            temp_page.insert_font(fontname="arabic", fontfile=ARABIC_FONT)
+            font = fitz.Font(fontfile=ARABIC_FONT)
 
             prepared_blocks = []
-
-            # تجهيز النصوص وحساب ارتفاع الترجمة
             for block in blocks:
                 arabic = block.get("arabic", "").strip()
-
                 if not arabic:
                     continue
-
-                lines = wrap_arabic(arabic)
-
-                prepared_blocks.append({
-                    "lines": lines,
-                })
-
-            translation_height = title_height + margin
-
-            for block in prepared_blocks:
-                translation_height += (
-                    len(block["lines"]) * line_height
-                    + paragraph_gap
+                lines = wrap_arabic_by_width(
+                    arabic, font, font_size, usable_width
                 )
+                prepared_blocks.append({"lines": lines})
 
-            translation_height = max(
-                translation_height,
-                100,
-            )
+            translation_height = margin + title_height + margin
+            for block in prepared_blocks:
+                translation_height += len(block["lines"]) * line_height + paragraph_gap
 
-            new_height = (
-                original_height
-                + margin
-                + translation_height
-                + margin
-            )
+            translation_height = max(translation_height, 100)
+            new_height = original_height + translation_height + margin
 
-            # إنشاء صفحة موسّعة
-            new_page = output.new_page(
-                width=width,
-                height=new_height,
-            )
+            new_page = output.new_page(width=width, height=new_height)
 
-            # الحفاظ على الصفحة الأصلية بكل محتوياتها
+            # نسخ الصفحة الأصلية بكل صورها ورسوماتها ونصوصها
             new_page.show_pdf_page(
-                fitz.Rect(
-                    0,
-                    0,
-                    width,
-                    original_height,
-                ),
+                fitz.Rect(0, 0, width, original_height),
                 original,
                 page_index,
             )
 
-            # تسجيل الخط العربي
-            new_page.insert_font(
-                fontname="arabic",
-                fontfile=ARABIC_FONT,
-            )
+            new_page.insert_font(fontname="arabic", fontfile=ARABIC_FONT)
 
             y = original_height + margin
 
-            # عنوان قسم الترجمة
-            title_rect = fitz.Rect(
-                margin,
-                y,
-                width - margin,
-                y + 30,
-            )
+            # عنوان الترجمة
+            title = prepare_arabic(f"الترجمة العربية - الصفحة {page_index + 1}")
+            title_baseline = y + 18
+            title_width = font.text_length(title, fontsize=14)
+            title_x = max(margin, width - margin - title_width)
 
-            new_page.insert_textbox(
-                title_rect,
-                prepare_arabic(
-                    f"الترجمة العربية - الصفحة {page_index + 1}"
-                ),
+            new_page.insert_text(
+                fitz.Point(title_x, title_baseline),
+                title,
                 fontname="arabic",
                 fontsize=14,
                 color=(0.8, 0, 0),
-                align=fitz.TEXT_ALIGN_RIGHT,
             )
-
             y += title_height
 
-            # إضافة الفقرات العربية باللون الأحمر
+            # إدراج كل سطر كنص مفرد، مع حساب موضعه من اليمين
             for block in prepared_blocks:
                 for line in block["lines"]:
                     shaped_line = prepare_arabic(line)
+                    line_width = font.text_length(shaped_line, fontsize=font_size)
+                    x = max(margin, width - margin - line_width)
 
-                    rect = fitz.Rect(
-                        margin,
-                        y,
-                        width - margin,
-                        y + line_height,
-                    )
-
-                    result = new_page.insert_textbox(
-                        rect,
+                    new_page.insert_text(
+                        fitz.Point(x, y + font_size + 2),
                         shaped_line,
                         fontname="arabic",
                         fontsize=font_size,
                         color=(0.8, 0, 0),
-                        align=fitz.TEXT_ALIGN_RIGHT,
                     )
-
-                    if result < 0:
-                        raise ValueError(
-                            f"تعذر إدراج النص العربي "
-                            f"في الصفحة {page_index + 1}."
-                        )
-
                     y += line_height
 
                 y += paragraph_gap
 
-            logger.info(
-                "Created bilingual page %s/%s.",
-                page_index + 1,
-                len(original),
-            )
+            temp_doc.close()
+            logger.info("Created bilingual page %s/%s.", page_index + 1, len(original))
 
-        output.save(
-            translated_path,
-            garbage=4,
-            deflate=True,
-        )
+        output.save(translated_path, garbage=4, deflate=True)
 
     finally:
         output.close()
@@ -521,7 +398,6 @@ def create_bilingual_pdf(
 
     if not os.path.exists(translated_path):
         raise FileNotFoundError("لم يتم إنشاء ملف PDF.")
-
     if os.path.getsize(translated_path) == 0:
         raise ValueError("ملف PDF الناتج فارغ.")
 
@@ -536,8 +412,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أهلاً بيك! 📚\n\n"
         "أرسل محاضرتك بصيغة PDF.\n\n"
-        "راح أحافظ على الصفحات الأصلية "
-        "وأضيف الترجمة العربية بالأحمر "
+        "راح أحافظ على الصفحات الأصلية وأضيف الترجمة العربية بالأحمر "
         "أسفل محتوى كل صفحة."
     )
 
@@ -546,41 +421,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 10. معالجة ملفات PDF
 # ==========================================
 
-async def handle_pdf(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     document = message.document
-
     if not document:
         return
 
     filename = document.file_name or "lecture.pdf"
-
     if not filename.lower().endswith(".pdf"):
         await message.reply_text("❌ أرسل ملف PDF فقط.")
         return
 
-    status = await message.reply_text(
-        "📥 استلمت المحاضرة!\nجاري تجهيز الملف..."
-    )
+    status = await message.reply_text("📥 استلمت المحاضرة!\nجاري تجهيز الملف...")
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             source_path = os.path.join(temp_dir, "source.pdf")
-            translated_path = os.path.join(
-                temp_dir, "bilingual_lecture.pdf"
-            )
+            translated_path = os.path.join(temp_dir, "bilingual_lecture.pdf")
 
             await status.edit_text("📥 جاري تنزيل ملف PDF...")
-
             tg_file = await context.bot.get_file(document.file_id)
             await tg_file.download_to_drive(source_path)
 
             with fitz.open(source_path) as pdf:
                 page_count = len(pdf)
-
             if page_count == 0:
                 raise ValueError("ملف PDF فارغ.")
 
@@ -589,16 +453,9 @@ async def handle_pdf(
                 "🌐 جاري استخراج النصوص وترجمتها..."
             )
 
-            translated_pages = await translate_document(
-                source_path,
-                status,
-            )
+            translated_pages = await translate_document(source_path, status)
 
-            await status.edit_text(
-                "📝 اكتملت الترجمة!\n"
-                "جاري إنشاء ملف PDF..."
-            )
-
+            await status.edit_text("📝 اكتملت الترجمة!\nجاري إنشاء ملف PDF...")
             await asyncio.to_thread(
                 create_bilingual_pdf,
                 source_path,
@@ -606,11 +463,7 @@ async def handle_pdf(
                 translated_path,
             )
 
-            await status.edit_text(
-                "✅ اكتملت المعالجة!\n"
-                "جاري إرسال الملف..."
-            )
-
+            await status.edit_text("✅ اكتملت المعالجة!\nجاري إرسال الملف...")
             with open(translated_path, "rb") as file:
                 await context.bot.send_document(
                     chat_id=message.chat_id,
@@ -618,27 +471,22 @@ async def handle_pdf(
                     filename="Bilingual_Lecture.pdf",
                     caption=(
                         "✅ تمت معالجة المحاضرة!\n\n"
-                        "تم الحفاظ على الصفحات الأصلية، "
-                        "وإضافة الترجمة العربية بالأحمر "
-                        "أسفل محتوى كل صفحة."
+                        "تم الحفاظ على الصفحات الأصلية، وإضافة الترجمة العربية "
+                        "بالأحمر أسفل محتوى كل صفحة."
                     ),
                     connect_timeout=30,
                     read_timeout=180,
                     write_timeout=180,
                     pool_timeout=30,
                 )
-
             await status.delete()
 
     except Exception as error:
         logger.exception("PDF processing failed: %s", error)
-
         error_text = str(error)[:700]
-
         try:
             await status.edit_text(
-                "❌ صار خطأ أثناء معالجة الملف:\n\n"
-                f"{error_text}"
+                "❌ صار خطأ أثناء معالجة الملف:\n\n" + error_text
             )
         except Exception:
             await message.reply_text(f"❌ خطأ: {error_text}")
@@ -648,10 +496,7 @@ async def handle_pdf(
 # 11. أمر /help
 # ==========================================
 
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📚 طريقة الاستخدام:\n\n"
         "1. أرسل ملف PDF.\n"
@@ -664,15 +509,8 @@ async def help_command(
 # 12. معالجة الأخطاء العامة
 # ==========================================
 
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    logger.error(
-        "Unhandled error: %s",
-        context.error,
-        exc_info=context.error,
-    )
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled error: %s", context.error, exc_info=context.error)
 
 
 # ==========================================
@@ -680,22 +518,10 @@ async def error_handler(
 # ==========================================
 
 def main():
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-
-    app.add_handler(
-        MessageHandler(
-            filters.Document.ALL,
-            handle_pdf,
-        )
-    )
-
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_pdf))
     app.add_error_handler(error_handler)
 
     logger.info("Bot is running...")
