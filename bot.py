@@ -1,9 +1,13 @@
 import os
-import logging
-import asyncio
 import re
+import asyncio
+import logging
+import tempfile
+import math
 from pathlib import Path
 
+import fitz
+from google import genai
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -13,14 +17,9 @@ from telegram.ext import (
     filters,
 )
 
-from google import genai
-from pypdf import PdfReader
-from docx import Document
-
-
-# =========================
-# إعدادات التسجيل
-# =========================
+# ==========================================
+# CONFIGURATION
+# ==========================================
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -28,126 +27,98 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# =========================
-# مفاتيح التشغيل
-# =========================
+MODEL_NAME = "gemini-3.8-flash"
+CHUNK_SIZE = 6000
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN is missing")
-
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is missing")
+if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
+    raise RuntimeError("Missing TELEGRAM_TOKEN or GEMINI_API_KEY")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-MODEL_NAME = "gemini-3.5-flash"
 
-# حجم كل جزء من النص بالأحرف
-CHUNK_SIZE = 8000
+# ==========================================
+# START COMMAND
+# ==========================================
 
-
-# =========================
-# رسالة البداية
-# =========================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    await update.message.reply_text(
-        "مرحباً بك يا سجاد! 📚\n\n"
-        "أرسل ملف PDF يحتوي على محاضرتك، "
-        "وسأترجمه إلى العربية الفصحى بأسلوب أكاديمي "
-        "وأرسل لك الترجمة كاملة بملف Word.\n\n"
-        "يمكنك إرسال محاضرات طويلة تتجاوز 3000 كلمة."
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "أهلاً بك في بوت ترجمة المحاضرات الجامعية 📚\n\n"
+        "أرسل ملف PDF وسأضيف الترجمة العربية فوق كل صفحة "
+        "مع الاحتفاظ بالصفحة الأصلية أسفلها.\n\n"
+        "📄 الناتج: ملف PDF مترجم."
     )
 
 
-# =========================
-# تقسيم النص إلى أجزاء
-# =========================
+# ==========================================
+# TEXT SPLITTING
+# ==========================================
 
-def split_text(text: str, max_chars: int = CHUNK_SIZE) -> list[str]:
-    """
-    تقسيم النص إلى أجزاء مع محاولة الحفاظ على الفقرات.
-    إذا كانت الفقرة طويلة جداً، يتم تقسيمها إلى أجزاء أصغر.
-    """
-
+def split_text(text, max_chars=CHUNK_SIZE):
     text = text.strip()
-
     if not text:
         return []
 
-    paragraphs = text.split("\n")
+    paragraphs = text.splitlines()
     chunks = []
-    current_chunk = ""
+    current = ""
 
     for paragraph in paragraphs:
         paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+
+        while len(paragraph) > max_chars:
+            if current:
+                chunks.append(current)
+                current = ""
+
+            chunks.append(paragraph[:max_chars])
+            paragraph = paragraph[max_chars:]
 
         if not paragraph:
             continue
 
-        # تقسيم الفقرة الطويلة إذا تجاوزت الحد
-        if len(paragraph) > max_chars:
-            if current_chunk:
-                chunks.append(current_chunk)
-                current_chunk = ""
-
-            for i in range(0, len(paragraph), max_chars):
-                chunks.append(paragraph[i:i + max_chars])
-
-            continue
-
         candidate = (
-            current_chunk + "\n\n" + paragraph
-            if current_chunk
-            else paragraph
+            current + "\n\n" + paragraph
+            if current else paragraph
         )
 
         if len(candidate) <= max_chars:
-            current_chunk = candidate
+            current = candidate
         else:
-            if current_chunk:
-                chunks.append(current_chunk)
+            if current:
+                chunks.append(current)
+            current = paragraph
 
-            current_chunk = paragraph
-
-    if current_chunk:
-        chunks.append(current_chunk)
+    if current:
+        chunks.append(current)
 
     return chunks
 
 
-# =========================
-# ترجمة جزء واحد باستخدام Gemini
-# =========================
+# ==========================================
+# GEMINI TRANSLATION
+# ==========================================
 
-def translate_chunk(text: str, part_number: int, total_parts: int) -> str:
-    if not text.strip():
-        return ""
-
+def translate_chunk(text, part, total):
     prompt = f"""
-أنت مترجم أكاديمي متخصص في ترجمة المحاضرات الجامعية،
-خصوصاً العلوم الطبية والتحليلات المرضية.
+أنت مترجم أكاديمي متخصص في العلوم الطبية والتحليلات المرضية.
 
-المطلوب:
-- ترجم النص الإنجليزي التالي إلى العربية الفصحى بدقة علمية.
-- حافظ على المعنى العلمي والمصطلحات الطبية.
-- اكتب المصطلح الإنجليزي بين قوسين عند الحاجة لتوضيح المصطلحات المهمة.
-- حافظ على الأرقام والعناوين والقوائم والاختصارات العلمية.
-- لا تختصر النص ولا تلخصه ولا تحذف أي معلومة.
-- لا تضف شرحاً من عندك.
+ترجم النص الإنجليزي التالي إلى العربية الفصحى بدقة علمية.
+
+التعليمات:
+- ترجم كل المعلومات دون اختصار أو تلخيص.
+- حافظ على المصطلحات الطبية والأرقام والاختصارات.
+- اكتب المصطلح الإنجليزي بين قوسين عند الحاجة.
+- حافظ على ترتيب العناوين والقوائم قدر الإمكان.
+- لا تضف معلومات من عندك.
 - أخرج الترجمة فقط دون مقدمة أو خاتمة.
-- هذا الجزء رقم {part_number} من أصل {total_parts}.
-- حافظ على ترابط النص مع الأجزاء الأخرى.
+- هذا الجزء {part} من أصل {total}.
 
-النص المطلوب ترجمته:
-
+النص:
 {text}
 """
 
@@ -156,177 +127,227 @@ def translate_chunk(text: str, part_number: int, total_parts: int) -> str:
         contents=prompt,
     )
 
-    translated = response.text
+    result = response.text
+    if not result or not result.strip():
+        raise ValueError("Empty Gemini response")
 
-    if not translated or not translated.strip():
-        raise ValueError("Gemini returned an empty translation")
-
-    return translated.strip()
+    return result.strip()
 
 
-# =========================
-# ترجمة النص الكامل على أجزاء
-# =========================
-
-async def translate_full_text(text: str) -> str:
+async def translate_text(text):
     chunks = split_text(text)
 
     if not chunks:
         return ""
 
-    translated_parts = []
-
-    total_parts = len(chunks)
+    results = []
 
     for index, chunk in enumerate(chunks, start=1):
-        logger.info(
-            "Translating part %s of %s",
-            index,
-            total_parts,
-        )
-
         translated = await asyncio.to_thread(
             translate_chunk,
             chunk,
             index,
-            total_parts,
+            len(chunks),
         )
+        results.append(translated)
 
-        translated_parts.append(translated)
-
-    return "\n\n".join(translated_parts)
+    return "\n\n".join(results)
 
 
-# =========================
-# معالجة ملفات PDF
-# =========================
+# ==========================================
+# CREATE BILINGUAL PDF
+# ==========================================
+
+def estimate_translation_height(text, page_width):
+    """
+    Estimate the space needed for the Arabic translation.
+    The original page will be placed below this area.
+    """
+    usable_width = max(page_width - 70, 200)
+    chars_per_line = max(25, int(usable_width / 7.5))
+
+    lines = 0
+    for paragraph in text.splitlines():
+        if paragraph.strip():
+            lines += max(
+                1,
+                math.ceil(len(paragraph) / chars_per_line)
+            )
+        else:
+            lines += 1
+
+    return max(150, min(2500, 85 + lines * 19))
+
+
+def add_translation_page(output_doc, source_doc, page_index, translated):
+    original_page = source_doc[page_index]
+    width = original_page.rect.width
+    height = original_page.rect.height
+
+    translation_height = estimate_translation_height(
+        translated,
+        width,
+    )
+
+    # Create a taller page: translation above, original below.
+    new_page = output_doc.new_page(
+        width=width,
+        height=height + translation_height,
+    )
+
+    # Arabic translation area.
+    translation_rect = fitz.Rect(
+        30,
+        25,
+        width - 30,
+        translation_height - 20,
+    )
+
+    html = f"""
+    <div dir="rtl" style="
+        font-family: sans-serif;
+        text-align: right;
+        font-size: 11pt;
+        line-height: 1.6;
+        color: #111111;
+    ">
+        <h2 style="text-align:center; font-size:15pt;">
+            الترجمة العربية
+        </h2>
+        {''.join(
+            '<p>' + paragraph.replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;') + '</p>'
+            for paragraph in translated.splitlines()
+            if paragraph.strip()
+        )}
+    </div>
+    """
+
+    new_page.insert_htmlbox(
+        translation_rect,
+        html,
+        css="p { margin: 3px 0; }",
+        scale_low=0.5,
+    )
+
+    # Insert original page unchanged below the translation.
+    original_rect = fitz.Rect(
+        0,
+        translation_height,
+        width,
+        translation_height + height,
+    )
+
+    new_page.show_pdf_page(
+        original_rect,
+        source_doc,
+        page_index,
+    )
+
+
+# ==========================================
+# DOCUMENT HANDLER
+# ==========================================
 
 async def handle_document(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-
-    message = update.message
+):
+    message = update.effective_message
     document = message.document
 
     if not document:
         return
 
-    file_name = document.file_name or "lecture.pdf"
+    filename = document.file_name or "lecture.pdf"
 
-    if not file_name.lower().endswith(".pdf"):
+    if not filename.lower().endswith(".pdf"):
         await message.reply_text(
-            "❌ حالياً البوت يدعم ملفات PDF فقط.\n"
-            "أرسل المحاضرة بصيغة PDF."
+            "❌ أرسل ملف PDF فقط."
         )
         return
 
-    safe_name = Path(file_name).stem
-    safe_name = re.sub(r"[^\w\-]+", "_", safe_name)
-    safe_name = safe_name[:80] or "lecture"
-
-    local_input = f"input_{document.file_unique_id}.pdf"
-    output_docx = f"Translated_{document.file_unique_id}.docx"
+    progress = await message.reply_text(
+        "📥 استلمت المحاضرة.\n"
+        "جاري قراءة الصفحات واستخراج النص..."
+    )
 
     try:
-        await message.reply_text(
-            "⏳ استلمت المحاضرة!\n\n"
-            "جاري قراءة الملف وتقسيم النص إلى أجزاء "
-            "وترجمته بالكامل.\n"
-            "قد تستغرق العملية بعض الوقت إذا كانت المحاضرة طويلة."
-        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = os.path.join(temp_dir, "input.pdf")
+            output_path = os.path.join(temp_dir, "translated.pdf")
 
-        telegram_file = await document.get_file()
-        await telegram_file.download_to_drive(local_input)
+            telegram_file = await document.get_file()
+            await telegram_file.download_to_drive(input_path)
 
-        # قراءة النص من PDF
-        reader = PdfReader(local_input)
+            source_doc = fitz.open(input_path)
+            output_doc = fitz.open()
 
-        full_text = ""
+            total_pages = len(source_doc)
 
-        for page_number, page in enumerate(reader.pages, start=1):
-            page_text = page.extract_text()
+            for index, page in enumerate(source_doc):
+                page_text = page.get_text("text").strip()
 
-            if page_text:
-                full_text += page_text + "\n\n"
+                if not page_text:
+                    translated = (
+                        "لم يتم العثور على نص قابل للاستخراج "
+                        "في هذه الصفحة. قد تكون الصفحة صورة "
+                        "وتحتاج إلى OCR."
+                    )
+                else:
+                    translated = await translate_text(page_text)
 
-        if not full_text.strip():
-            await message.reply_text(
-                "❌ لم أتمكن من استخراج النص من الملف.\n"
-                "قد يكون الملف عبارة عن صور ممسوحة ضوئياً "
-                "ويحتاج إلى تقنية OCR."
-            )
-            return
+                add_translation_page(
+                    output_doc,
+                    source_doc,
+                    index,
+                    translated,
+                )
 
-        word_count = len(full_text.split())
+                await progress.edit_text(
+                    "⏳ جاري ترجمة المحاضرة...\n\n"
+                    f"تمت معالجة الصفحة {index + 1} "
+                    f"من {total_pages}."
+                )
 
-        await message.reply_text(
-            f"📄 تم استخراج النص بنجاح.\n"
-            f"عدد الكلمات التقريبي: {word_count}\n\n"
-            f"🔄 جاري ترجمة المحاضرة كاملة..."
-        )
+            output_doc.save(output_path)
+            output_doc.close()
+            source_doc.close()
 
-        # ترجمة جميع الأجزاء
-        translated_full = await translate_full_text(full_text)
+            with open(output_path, "rb") as result_file:
+                await message.reply_document(
+                    document=result_file,
+                    filename=f"Translated_{Path(filename).stem}.pdf",
+                    caption=(
+                        "✅ اكتملت ترجمة المحاضرة!\n"
+                        "📄 الترجمة العربية بالأعلى "
+                        "والصفحة الأصلية بالأسفل."
+                    ),
+                )
 
-        if not translated_full.strip():
-            await message.reply_text(
-                "❌ لم يتم إنشاء ترجمة. حاول مرة أخرى."
-            )
-            return
-
-        # إنشاء ملف Word
-        output_doc = Document()
-
-        output_doc.add_heading(
-            f"ترجمة المحاضرة: {safe_name}",
-            level=1,
-        )
-
-        output_doc.add_paragraph(
-            f"عدد كلمات النص الأصلي: {word_count}"
-        )
-
-        for paragraph in translated_full.split("\n"):
-            if paragraph.strip():
-                output_doc.add_paragraph(paragraph.strip())
-
-        output_doc.save(output_docx)
-
-        # إرسال ملف الترجمة
-        with open(output_docx, "rb") as translated_file:
-            await message.reply_document(
-                document=translated_file,
-                filename=f"Translated_{safe_name}.docx",
-                caption="✅ تمت ترجمة المحاضرة وإعداد ملف Word."
+            await progress.edit_text(
+                "✅ تمت ترجمة المحاضرة وإرسال ملف PDF."
             )
 
-    except Exception as e:
-        logger.exception("Error processing document: %s", e)
-
-        await message.reply_text(
-            "❌ حدث خطأ أثناء معالجة المحاضرة.\n"
-            "تأكد من أن الملف سليم وأن خدمة الترجمة تعمل، "
-            "ثم حاول مرة أخرى."
+    except Exception:
+        logger.exception("PDF translation failed")
+        await progress.edit_text(
+            "❌ حدث خطأ أثناء ترجمة الملف.\n"
+            "تحقق من إعدادات Gemini API وحاول مرة أخرى."
         )
 
-    finally:
-        for path in (local_input, output_docx):
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except OSError:
-                    logger.warning("Could not remove temporary file: %s", path)
 
+# ==========================================
+# MAIN
+# ==========================================
 
-# =========================
-# تشغيل البوت
-# =========================
-
-def main() -> None:
-    application = Application.builder().token(
-        TELEGRAM_TOKEN
-    ).build()
+def main():
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .build()
+    )
 
     application.add_handler(
         CommandHandler("start", start)
@@ -339,8 +360,7 @@ def main() -> None:
         )
     )
 
-    logger.info("Bot is running...")
-
+    logger.info("PDF translation bot started")
     application.run_polling()
 
 
