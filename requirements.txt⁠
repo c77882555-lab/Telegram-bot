@@ -1,5 +1,5 @@
-python-telegram-bot
-groq
-pymupdf
-arabic-reshaper
-python-bidi
+python-telegram-bot>=20.7,<23
+PyMuPDF>=1.24
+arabic-reshaper>=3.0.0
+python-bidi>=0.4.2
+groq>=0.11.0
