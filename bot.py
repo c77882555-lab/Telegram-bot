@@ -257,12 +257,16 @@ def wrap_arabic_by_width(text, font, fontsize, max_width):
 
 
 # ==========================================
-# 6. إنشاء PDF: الترجمة الحمراء تحت كل فقرة
+# 6. إنشاء PDF: إدراج الترجمة تحت كل فقرة
 # ==========================================
 
 def create_bilingual_pdf(source_path, translated_pages, translated_path):
-    logger.info("Starting in-place bilingual PDF creation.")
-
+    """
+    يضيف الترجمة الحمراء مباشرة بعد كل كتلة نصية.
+    تُقسّم الصفحة الأصلية إلى مقاطع أفقية، ويُدرج بين المقاطع
+    شريط للترجمة، ثم يُزاح ما تبقى من الصفحة إلى الأسفل.
+    هذا يمنع تداخل الترجمة مع الفقرات التالية ويحافظ على الرسومات.
+    """
     if not os.path.isfile(ARABIC_FONT):
         raise FileNotFoundError(
             f"خط العربية غير موجود: {ARABIC_FONT}\n"
@@ -270,92 +274,175 @@ def create_bilingual_pdf(source_path, translated_pages, translated_path):
             "أو عيّن متغير ARABIC_FONT إلى مسار الخط."
         )
 
-    output = fitz.open()
     original = fitz.open(source_path)
+    output = fitz.open()
 
     try:
         if len(original) != len(translated_pages):
             raise ValueError("عدد الصفحات الأصلية لا يطابق عدد صفحات الترجمة.")
 
         font = fitz.Font(fontfile=ARABIC_FONT)
+        font_size = 10.5
+        margin_x = 28
+        gap_before_translation = 3
+        gap_after_translation = 8
+        line_height = font_size * 1.65
+
+        def wrap_arabic(text, max_width):
+            words = (text or "").split()
+            lines = []
+            current = ""
+            for word in words:
+                candidate = f"{current} {word}".strip()
+                shaped = prepare_arabic(candidate)
+                try:
+                    width = font.text_length(shaped, fontsize=font_size)
+                except Exception:
+                    width = len(candidate) * font_size * 0.65
+
+                if width <= max_width:
+                    current = candidate
+                else:
+                    if current:
+                        lines.append(current)
+                    current = word
+            if current:
+                lines.append(current)
+            return lines or [""]
 
         for page_index, source_page in enumerate(original):
-            # نسخ الصفحة الأصلية بنفس أبعادها، مع صورها ورسوماتها
-            page = output.new_page(
-                width=source_page.rect.width,
-                height=source_page.rect.height,
-            )
-            page.show_pdf_page(page.rect, original, page_index)
-            page.insert_font(fontname="arabic", fontfile=ARABIC_FONT)
+            page_rect = source_page.rect
+            page_width = page_rect.width
+            page_height = page_rect.height
+            page_blocks = translated_pages[page_index]
 
-            page_rect = page.rect
-            blocks = translated_pages[page_index]
-
-            # معالجة الفقرات من الأعلى إلى الأسفل حتى تبقى مرتبة
-            blocks = sorted(
-                blocks,
-                key=lambda item: (item["bbox"][1], item["bbox"][0])
-            )
-
-            for block in blocks:
-                arabic = (block.get("arabic") or "").strip()
-                bbox = block.get("bbox")
+            # ترتيب الفقرات לפי نهاية الفقرة حتى نضيف الترجمة تحتها
+            candidates = []
+            for item in page_blocks:
+                arabic = (item.get("arabic") or "").strip()
+                bbox = item.get("bbox")
                 if not arabic or not bbox or len(bbox) != 4:
                     continue
-
                 x0, y0, x1, y1 = map(float, bbox)
-                # الترجمة تبدأ مباشرة بعد نهاية الفقرة الإنجليزية
-                gap = 3.0
-                left = max(page_rect.x0 + 6, x0)
-                right = min(page_rect.x1 - 6, x1)
-                top = y1 + gap
-
-                if right <= left or top >= page_rect.y1 - 3:
-                    logger.warning(
-                        "No room below text block on page %s; skipping its Arabic.",
-                        page_index + 1,
-                    )
+                y1 = min(max(y1, 0), page_height)
+                if y1 <= 0:
                     continue
+                lines = wrap_arabic(arabic, page_width - 2 * margin_x)
+                text_height = max(1, len(lines)) * line_height + 6
+                candidates.append({
+                    "y0": max(0, float(y0)),
+                    "y1": y1,
+                    "arabic": arabic,
+                    "lines": lines,
+                    "height": text_height,
+                })
 
-                box_width = right - left
-                available_height = page_rect.y1 - top - 3
-                # حجم خط مبدئي صغير نسبياً حتى يناسب عرض الفقرة
-                font_size = 9.5
-                lines = wrap_arabic_by_width(arabic, font, font_size, box_width)
+            candidates.sort(key=lambda item: (item["y1"], item["y0"]))
 
-                # ارتفاع تقريبي لأسطر الترجمة، دون إنشاء مساحة أسفل الصفحة
-                line_height = font_size * 1.55
-                needed_height = max(line_height + 2, len(lines) * line_height + 2)
-                box_height = min(needed_height, available_height)
+            # اجمع الكتل التي تنتهي تقريباً عند نفس المستوى لتجنب تقسيم الصفحة مرتين
+            groups = []
+            for item in candidates:
+                if groups and abs(item["y1"] - groups[-1]["y1"]) <= 3:
+                    groups[-1]["items"].append(item)
+                    groups[-1]["y1"] = max(groups[-1]["y1"], item["y1"])
+                else:
+                    groups.append({"y1": item["y1"], "items": [item]})
 
-                # إذا كان المكان ضيقاً، نقلل حجم الخط تدريجياً
-                while box_height < needed_height and font_size > 6.0:
-                    font_size -= 0.5
-                    lines = wrap_arabic_by_width(arabic, font, font_size, box_width)
-                    line_height = font_size * 1.55
-                    needed_height = max(line_height + 2, len(lines) * line_height + 2)
-                    box_height = min(needed_height, available_height)
+            # لا نترجم النصوص القصيرة جداً التي تكون غالباً أرقام صفحات أو تسميات صغيرة
+            # ونبقي الفقرات والقوائم والعناوين النصية.
+            filtered_groups = []
+            for group in groups:
+                valid_items = [
+                    item for item in group["items"]
+                    if len(item["arabic"]) >= 8
+                ]
+                if valid_items:
+                    group["items"] = valid_items
+                    filtered_groups.append(group)
 
-                # منع الكتابة خارج الصفحة. قد لا تظهر ترجمة الفقرات القريبة جداً من أسفل الصفحة.
-                rect = fitz.Rect(left, top, right, min(page_rect.y1 - 2, top + box_height))
-                shaped_text = "\n".join(prepare_arabic(line) for line in lines)
+            # احسب ارتفاع كل شريط ترجمة قبل إنشاء الصفحة
+            for group in filtered_groups:
+                group["strip_height"] = (
+                    gap_before_translation
+                    + sum(item["height"] for item in group["items"])
+                    + gap_after_translation
+                )
 
-                try:
-                    page.insert_textbox(
-                        rect,
-                        shaped_text,
+            total_extra = sum(group["strip_height"] for group in filtered_groups)
+            new_page = output.new_page(
+                width=page_width,
+                height=page_height + total_extra,
+            )
+            new_page.insert_font(fontname="arabic", fontfile=ARABIC_FONT)
+
+            source_cursor = 0.0
+            target_cursor = 0.0
+
+            for group in filtered_groups:
+                cut_y = min(max(group["y1"], source_cursor), page_height)
+
+                # انسخ المقطع الأصلي كما هو، مع إزاحة المقطع اللاحق للأسفل
+                if cut_y > source_cursor:
+                    source_clip = fitz.Rect(
+                        0, source_cursor, page_width, cut_y
+                    )
+                    target_rect = fitz.Rect(
+                        0, target_cursor, page_width,
+                        target_cursor + (cut_y - source_cursor),
+                    )
+                    new_page.show_pdf_page(
+                        target_rect,
+                        original,
+                        page_index,
+                        clip=source_clip,
+                        overlay=True,
+                    )
+                    target_cursor += cut_y - source_cursor
+                    source_cursor = cut_y
+
+                target_cursor += gap_before_translation
+
+                for item in group["items"]:
+                    block_height = item["height"]
+                    translation_rect = fitz.Rect(
+                        margin_x,
+                        target_cursor,
+                        page_width - margin_x,
+                        target_cursor + block_height,
+                    )
+                    shaped = "\n".join(
+                        prepare_arabic(line) for line in item["lines"]
+                    )
+                    new_page.insert_textbox(
+                        translation_rect,
+                        shaped,
                         fontname="arabic",
                         fontsize=font_size,
                         color=(0.82, 0.0, 0.0),
                         align=fitz.TEXT_ALIGN_RIGHT,
-                        lineheight=1.25,
+                        lineheight=1.3,
                         overlay=True,
                     )
-                except Exception as error:
-                    logger.warning(
-                        "Arabic insertion failed on page %s: %s",
-                        page_index + 1, error,
-                    )
+                    target_cursor += block_height
+
+                target_cursor += gap_after_translation
+
+            # انسخ ما تبقى من الصفحة الأصلية بعد آخر ترجمة
+            if source_cursor < page_height:
+                source_clip = fitz.Rect(
+                    0, source_cursor, page_width, page_height
+                )
+                target_rect = fitz.Rect(
+                    0, target_cursor, page_width,
+                    target_cursor + (page_height - source_cursor),
+                )
+                new_page.show_pdf_page(
+                    target_rect,
+                    original,
+                    page_index,
+                    clip=source_clip,
+                    overlay=True,
+                )
 
             logger.info("Created page %s/%s.", page_index + 1, len(original))
 
