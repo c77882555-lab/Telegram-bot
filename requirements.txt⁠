@@ -1,3 +1,5 @@
-python-telegram-bot==21.10
-PyMuPDF==1.25.3
+python-telegram-bot
 groq
+pymupdf
+arabic-reshaper
+python-bidi
