@@ -1,8 +1,10 @@
 import os
+import re
 import asyncio
 import tempfile
 import logging
 import html
+import time
 
 import fitz
 from groq import Groq
@@ -29,6 +31,12 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 MODEL_NAME = "openai/gpt-oss-120b"
 
+# عدد الفقرات في كل طلب ترجمة
+BATCH_SIZE = 4
+
+# عدد محاولات إعادة الطلب عند الخطأ
+MAX_RETRIES = 5
+
 if not BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_TOKEN")
 
@@ -37,8 +45,8 @@ if not GROQ_API_KEY:
 
 client = Groq(
     api_key=GROQ_API_KEY,
-    timeout=60.0,
-    max_retries=1,
+    timeout=120.0,
+    max_retries=0,
 )
 
 logging.basicConfig(
@@ -50,52 +58,178 @@ logger = logging.getLogger(__name__)
 
 
 # ==========================================
-# 2. ترجمة النص باستخدام Groq
+# 2. الاتصال بـ Groq مع إعادة المحاولة
+# ==========================================
+
+def groq_request(messages):
+    for attempt in range(MAX_RETRIES):
+        try:
+            return client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                temperature=0.1,
+            )
+
+        except Exception as error:
+            status_code = getattr(error, "status_code", None)
+
+            if status_code == 429 or status_code in (500, 502, 503, 504):
+                wait_time = min(2 ** (attempt + 1), 30)
+
+                logger.warning(
+                    "Groq error %s. Retry %s/%s after %s seconds.",
+                    status_code,
+                    attempt + 1,
+                    MAX_RETRIES,
+                    wait_time,
+                )
+
+                if attempt == MAX_RETRIES - 1:
+                    raise
+
+                time.sleep(wait_time)
+
+            else:
+                raise
+
+    raise RuntimeError("Groq request failed after retries.")
+
+
+# ==========================================
+# 3. ترجمة فقرة واحدة
 # ==========================================
 
 def translate_text(text: str) -> str:
     if not text.strip():
         return ""
 
-    logger.info(
-        "Sending text to Groq (%s characters)",
-        len(text),
-    )
-
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a professional medical translator. "
-                    "Translate the English text into accurate, clear Arabic. "
-                    "Preserve medical terminology, numbers, abbreviations, "
-                    "lists, and all important details. "
-                    "Do not summarize or omit anything. "
-                    "Return only the Arabic translation."
-                ),
-            },
-            {
-                "role": "user",
-                "content": text,
-            },
-        ],
-        temperature=0.1,
-    )
+    response = groq_request([
+        {
+            "role": "system",
+            "content": (
+                "You are a professional medical translator. "
+                "Translate the English text into accurate, clear Arabic. "
+                "Preserve medical terminology, numbers, abbreviations, "
+                "lists, and all important details. "
+                "Do not summarize or omit anything. "
+                "Return only the Arabic translation."
+            ),
+        },
+        {
+            "role": "user",
+            "content": text,
+        },
+    ])
 
     result = response.choices[0].message.content
 
     if not result or not result.strip():
         raise ValueError("Groq returned an empty translation.")
 
-    logger.info("Groq translation completed successfully.")
-
     return result.strip()
 
 
 # ==========================================
-# 3. استخراج النصوص من PDF
+# 4. ترجمة عدة فقرات بطلب واحد
+# ==========================================
+
+def translate_batch(texts):
+    if not texts:
+        return []
+
+    if len(texts) == 1:
+        return [translate_text(texts[0])]
+
+    markers = [
+        f"<<<BLOCK_{i}>>>"
+        for i in range(1, len(texts) + 1)
+    ]
+
+    combined_text = "\n\n".join(
+        f"{markers[i]}\n{text}"
+        for i, text in enumerate(texts)
+    )
+
+    logger.info(
+        "Sending batch of %s paragraphs to Groq.",
+        len(texts),
+    )
+
+    response = groq_request([
+        {
+            "role": "system",
+            "content": (
+                "You are a professional medical translator. "
+                "Translate each English block into accurate Arabic. "
+                "Preserve medical terminology, numbers, abbreviations, "
+                "lists, and all important details. Do not summarize. "
+                "Return every block in the same order. "
+                "You MUST reproduce each block marker exactly as given, "
+                "on a separate line, followed by its Arabic translation. "
+                "Do not omit, rename, or add markers. "
+                "Do not include explanations."
+            ),
+        },
+        {
+            "role": "user",
+            "content": combined_text,
+        },
+    ])
+
+    result = response.choices[0].message.content
+
+    if not result or not result.strip():
+        raise ValueError("Groq returned an empty batch translation.")
+
+    # استخراج النص بين العلامات
+    pattern = re.compile(
+        r"<<<BLOCK_(\d+)>>>"
+    )
+
+    matches = list(pattern.finditer(result))
+
+    translations = {}
+
+    for index, match in enumerate(matches):
+        block_number = int(match.group(1))
+
+        start = match.end()
+
+        end = (
+            matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(result)
+        )
+
+        translations[block_number] = result[start:end].strip()
+
+    # إذا لم يرجع النموذج كل العلامات، نترجم الفقرات الناقصة
+    output = []
+
+    for i, text in enumerate(texts, start=1):
+        translated = translations.get(i, "")
+
+        if not translated:
+            logger.warning(
+                "Missing translation for block %s. "
+                "Retrying individually.",
+                i,
+            )
+
+            translated = translate_text(text)
+
+        output.append(translated)
+
+    logger.info(
+        "Batch translation completed: %s paragraphs.",
+        len(output),
+    )
+
+    return output
+
+
+# ==========================================
+# 5. استخراج النصوص من PDF
 # ==========================================
 
 def extract_blocks(page):
@@ -122,7 +256,7 @@ def extract_blocks(page):
 
 
 # ==========================================
-# 4. ترجمة جميع صفحات المحاضرة
+# 6. ترجمة جميع صفحات المحاضرة
 # ==========================================
 
 async def translate_document(source_path, status):
@@ -134,10 +268,14 @@ async def translate_document(source_path, status):
         if total_pages == 0:
             raise ValueError("ملف PDF فارغ.")
 
-        total_paragraphs = 0
+        all_blocks = [
+            extract_blocks(page)
+            for page in pdf
+        ]
 
-        for page in pdf:
-            total_paragraphs += len(extract_blocks(page))
+    total_paragraphs = sum(
+        len(blocks) for blocks in all_blocks
+    )
 
     if total_paragraphs == 0:
         raise ValueError(
@@ -146,84 +284,85 @@ async def translate_document(source_path, status):
         )
 
     logger.info(
-        "PDF contains %s pages and %s paragraphs",
+        "PDF contains %s pages and %s paragraphs.",
         total_pages,
         total_paragraphs,
     )
 
     completed = 0
 
-    with fitz.open(source_path) as pdf:
-        for page_index, page in enumerate(pdf, start=1):
-            blocks = extract_blocks(page)
-            translated_blocks = []
+    for page_index, blocks in enumerate(
+        all_blocks, start=1
+    ):
+        translated_blocks = []
+
+        logger.info(
+            "Processing page %s/%s.",
+            page_index,
+            total_pages,
+        )
+
+        for start in range(0, len(blocks), BATCH_SIZE):
+            batch = blocks[start:start + BATCH_SIZE]
+
+            english_texts = [
+                block["text"] for block in batch
+            ]
 
             logger.info(
-                "Processing page %s/%s",
+                "Translating page %s, batch %s.",
                 page_index,
-                total_pages,
+                start // BATCH_SIZE + 1,
             )
 
-            for block_index, block in enumerate(
-                blocks, start=1
+            arabic_texts = await asyncio.to_thread(
+                translate_batch,
+                english_texts,
+            )
+
+            for english, arabic in zip(
+                english_texts, arabic_texts
             ):
-                english_text = block["text"]
-
-                logger.info(
-                    "Starting page %s paragraph %s/%s",
-                    page_index,
-                    block_index,
-                    len(blocks),
-                )
-
-                arabic_text = await asyncio.to_thread(
-                    translate_text,
-                    english_text,
-                )
-
                 translated_blocks.append({
-                    "english": english_text,
-                    "arabic": arabic_text,
+                    "english": english,
+                    "arabic": arabic,
                 })
 
-                completed += 1
+            completed += len(batch)
 
-                logger.info(
-                    "Completed paragraph %s/%s",
-                    completed,
-                    total_paragraphs,
+            logger.info(
+                "Completed %s/%s paragraphs.",
+                completed,
+                total_paragraphs,
+            )
+
+            try:
+                await status.edit_text(
+                    "🌐 جاري ترجمة المحاضرة...\n\n"
+                    f"📄 الصفحة: {page_index}/{total_pages}\n"
+                    f"📝 الفقرات المترجمة: "
+                    f"{completed}/{total_paragraphs}"
+                )
+            except Exception:
+                logger.warning(
+                    "Could not update progress message."
                 )
 
-                # تحديث حالة البوت كل 3 فقرات أو عند نهاية الصفحة
-                if (
-                    completed % 3 == 0
-                    or block_index == len(blocks)
-                ):
-                    try:
-                        await status.edit_text(
-                            "🌐 جاري ترجمة المحاضرة...\n\n"
-                            f"📄 الصفحة: {page_index}/{total_pages}\n"
-                            f"📝 الفقرات المترجمة: "
-                            f"{completed}/{total_paragraphs}"
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Could not update progress message."
-                        )
-
-            translated_pages.append(translated_blocks)
+        translated_pages.append(translated_blocks)
 
     return translated_pages
 
 
 # ==========================================
-# 5. إنشاء PDF ثنائي اللغة
+# 7. إنشاء PDF ثنائي اللغة
 # ==========================================
 
 def create_bilingual_pdf(
     translated_pages,
     translated_path,
 ):
+    logger.info("Starting PDF creation.")
+
     writer = fitz.DocumentWriter(translated_path)
 
     page_width = 595
@@ -322,24 +461,55 @@ def create_bilingual_pdf(
             )
 
             more = True
+            generated_pages = 0
 
             while more:
+                generated_pages += 1
+
+                # حماية من حلقة لا نهائية
+                if generated_pages > 100:
+                    raise RuntimeError(
+                        f"Too many generated pages for source page "
+                        f"{page_number}. Stopping to prevent a loop."
+                    )
+
                 device = writer.begin_page(page_rect)
                 more = story.place(content_rect)
                 story.draw(device)
                 writer.end_page()
 
+                logger.info(
+                    "PDF page %s: generated page %s.",
+                    page_number,
+                    generated_pages,
+                )
+
             logger.info(
-                "Created translated page %s",
+                "Created translated page %s.",
                 page_number,
             )
 
     finally:
         writer.close()
 
+    if not os.path.exists(translated_path):
+        raise FileNotFoundError(
+            "Translated PDF was not created."
+        )
+
+    if os.path.getsize(translated_path) == 0:
+        raise ValueError(
+            "Translated PDF is empty."
+        )
+
+    logger.info(
+        "Translated PDF created successfully. Size: %s bytes.",
+        os.path.getsize(translated_path),
+    )
+
 
 # ==========================================
-# 6. دمج PDF المترجم مع الأصلي
+# 8. دمج PDF المترجم مع الأصلي
 # ==========================================
 
 def merge_pdfs(
@@ -347,6 +517,8 @@ def merge_pdfs(
     source_path,
     output_path,
 ):
+    logger.info("Starting PDF merge.")
+
     translated = fitz.open(translated_path)
     original = fitz.open(source_path)
     output = fitz.open()
@@ -366,11 +538,24 @@ def merge_pdfs(
         translated.close()
         original.close()
 
-    logger.info("PDF merge completed.")
+    if not os.path.exists(output_path):
+        raise FileNotFoundError(
+            "Final PDF was not created."
+        )
+
+    if os.path.getsize(output_path) == 0:
+        raise ValueError(
+            "Final PDF is empty."
+        )
+
+    logger.info(
+        "PDF merge completed. Final size: %s bytes.",
+        os.path.getsize(output_path),
+    )
 
 
 # ==========================================
-# 7. أمر /start
+# 9. أمر /start
 # ==========================================
 
 async def start(
@@ -387,7 +572,7 @@ async def start(
 
 
 # ==========================================
-# 8. معالجة ملفات PDF
+# 10. معالجة ملفات PDF
 # ==========================================
 
 async def handle_pdf(
@@ -453,7 +638,7 @@ async def handle_pdf(
                 raise ValueError("ملف PDF فارغ.")
 
             logger.info(
-                "Downloaded PDF: %s pages",
+                "Downloaded PDF: %s pages.",
                 page_count,
             )
 
@@ -474,11 +659,15 @@ async def handle_pdf(
                 "جاري إنشاء ملف PDF..."
             )
 
+            logger.info("PDF creation started.")
+
             await asyncio.to_thread(
                 create_bilingual_pdf,
                 translated_pages,
                 translated_path,
             )
+
+            logger.info("PDF creation finished.")
 
             # دمج الملفين
             await status.edit_text(
@@ -492,15 +681,22 @@ async def handle_pdf(
                 output_path,
             )
 
+            logger.info("PDF merge finished.")
+
             if not os.path.exists(output_path):
                 raise FileNotFoundError(
                     "لم يتم إنشاء ملف PDF النهائي."
                 )
 
-            if os.path.getsize(output_path) == 0:
-                raise ValueError(
-                    "الملف النهائي فارغ."
-                )
+            output_size = os.path.getsize(output_path)
+
+            if output_size == 0:
+                raise ValueError("الملف النهائي فارغ.")
+
+            logger.info(
+                "Final PDF ready: %s bytes.",
+                output_size,
+            )
 
             # إرسال الملف
             await status.edit_text(
@@ -508,8 +704,11 @@ async def handle_pdf(
                 "جاري إرسال الملف..."
             )
 
+            logger.info("Starting Telegram document upload.")
+
             with open(output_path, "rb") as file:
-                await message.reply_document(
+                await context.bot.send_document(
+                    chat_id=message.chat_id,
                     document=file,
                     filename="Bilingual_Lecture.pdf",
                     caption=(
@@ -518,13 +717,15 @@ async def handle_pdf(
                         "والترجمة العربية بالأحمر تحته، "
                         "وصفحات المحاضرة الأصلية مرفقة بالنهاية."
                     ),
+                    connect_timeout=30,
+                    read_timeout=180,
+                    write_timeout=180,
+                    pool_timeout=30,
                 )
 
-            await status.delete()
+            logger.info("PDF successfully sent to user.")
 
-            logger.info(
-                "PDF successfully sent to user."
-            )
+            await status.delete()
 
     except Exception as error:
         logger.exception(
@@ -546,7 +747,7 @@ async def handle_pdf(
 
 
 # ==========================================
-# 9. أمر /help
+# 11. أمر /help
 # ==========================================
 
 async def help_command(
@@ -562,7 +763,7 @@ async def help_command(
 
 
 # ==========================================
-# 10. معالجة الأخطاء العامة
+# 12. معالجة الأخطاء العامة
 # ==========================================
 
 async def error_handler(
@@ -577,7 +778,7 @@ async def error_handler(
 
 
 # ==========================================
-# 11. تشغيل البوت
+# 13. تشغيل البوت
 # ==========================================
 
 def main():
