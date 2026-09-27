@@ -1,10 +1,8 @@
-
 import os
 import asyncio
-import logging
 import tempfile
-import math
-from pathlib import Path
+import logging
+import html
 
 import fitz
 from groq import Groq
@@ -17,349 +15,362 @@ from telegram.ext import (
     filters,
 )
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
+# =========================
+# إعدادات البوت
+# =========================
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+
+MODEL_NAME = "openai/gpt-oss-120b"
+
+client = Groq(api_key=GROQ_API_KEY)
 
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-MODEL_NAME = "openai/gpt-oss-120b"
-CHUNK_SIZE = 6000
+# =========================
+# الترجمة عبر Groq
+# =========================
 
-if not TELEGRAM_TOKEN or not GROQ_API_KEY:
-    raise RuntimeError("Missing TELEGRAM_TOKEN or GROQ_API_KEY")
+def translate_text(text: str) -> str:
+    """ترجمة فقرة إنكليزية إلى العربية."""
 
-client = Groq(api_key=GROQ_API_KEY)
-
-
-# ==========================================
-# START COMMAND
-# ==========================================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "أهلاً بك في بوت ترجمة المحاضرات الجامعية 📚\n\n"
-        "أرسل ملف PDF وسأضيف الترجمة العربية فوق كل صفحة "
-        "مع الاحتفاظ بالصفحة الأصلية أسفلها.\n\n"
-        "📄 الناتج: ملف PDF مترجم."
-    )
-
-
-# ==========================================
-# TEXT SPLITTING
-# ==========================================
-
-def split_text(text, max_chars=CHUNK_SIZE):
-    text = text.strip()
-    if not text:
-        return []
-
-    paragraphs = text.splitlines()
-    chunks = []
-    current = ""
-
-    for paragraph in paragraphs:
-        paragraph = paragraph.strip()
-        if not paragraph:
-            continue
-
-        while len(paragraph) > max_chars:
-            if current:
-                chunks.append(current)
-                current = ""
-
-            chunks.append(paragraph[:max_chars])
-            paragraph = paragraph[max_chars:]
-
-        if not paragraph:
-            continue
-
-        candidate = (
-            current + "\n\n" + paragraph
-            if current else paragraph
-        )
-
-        if len(candidate) <= max_chars:
-            current = candidate
-        else:
-            if current:
-                chunks.append(current)
-            current = paragraph
-
-    if current:
-        chunks.append(current)
-
-    return chunks
-
-
-# ==========================================
-# GROQ TRANSLATION
-# ==========================================
-
-def translate_chunk(text, part, total):
-    prompt = f"""
-أنت مترجم أكاديمي متخصص في العلوم الطبية والتحليلات المرضية.
-
-ترجم النص الإنجليزي التالي إلى العربية الفصحى بدقة علمية.
-
-التعليمات:
-- ترجم كل المعلومات دون اختصار أو تلخيص.
-- حافظ على المصطلحات الطبية والأرقام والاختصارات.
-- اكتب المصطلح الإنجليزي بين قوسين عند الحاجة.
-- حافظ على ترتيب العناوين والقوائم قدر الإمكان.
-- لا تضف معلومات من عندك.
-- أخرج الترجمة فقط دون مقدمة أو خاتمة.
-- هذا الجزء {part} من أصل {total}.
-
-النص:
-{text}
-"""
+    if not text.strip():
+        return ""
 
     response = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[
             {
+                "role": "system",
+                "content": (
+                    "You are a professional medical lecture translator. "
+                    "Translate the provided English text into accurate, "
+                    "clear Arabic. Preserve medical terminology and all "
+                    "important details, numbers, abbreviations, and lists. "
+                    "Do not summarize, omit, or add explanations. "
+                    "Return only the Arabic translation."
+                ),
+            },
+            {
                 "role": "user",
-                "content": prompt,
-            }
+                "content": text,
+            },
         ],
-        temperature=0,
+        temperature=0.1,
     )
 
-    result = response.choices[0].message.content
-
-    if not result or not result.strip():
-        raise ValueError("Empty Groq response")
-
-    return result.strip()
+    return response.choices[0].message.content.strip()
 
 
-async def translate_text(text):
-    chunks = split_text(text)
+# =========================
+# استخراج فقرات الصفحة
+# =========================
 
-    if not chunks:
-        return ""
+def extract_blocks(page):
+    """استخراج النصوص وترتيبها من الأعلى إلى الأسفل."""
 
-    results = []
+    blocks = page.get_text("blocks", sort=True)
+    result = []
 
-    for index, chunk in enumerate(chunks, start=1):
-        translated = await asyncio.to_thread(
-            translate_chunk,
-            chunk,
-            index,
-            len(chunks),
+    for block in blocks:
+        x0, y0, x1, y1, text = block[:5]
+
+        # تجاهل كتل الصور والكتل الفارغة
+        if not isinstance(text, str) or not text.strip():
+            continue
+
+        text = text.strip()
+
+        # تجاهل النصوص القصيرة جداً التي غالباً تكون أرقام صفحات
+        if len(text) < 2:
+            continue
+
+        result.append({
+            "text": text,
+            "x0": x0,
+            "y0": y0,
+            "x1": x1,
+            "y1": y1,
+        })
+
+    return result
+
+
+# =========================
+# إنشاء HTML ثنائي اللغة
+# =========================
+
+def make_bilingual_html(blocks):
+    """الإنكليزي بالأسود والترجمة العربية بالأحمر تحته."""
+
+    parts = []
+
+    for block in blocks:
+        english = html.escape(block["text"])
+
+        arabic = translate_text(block["text"])
+        arabic = html.escape(arabic)
+
+        parts.append(
+            f"""
+            <div class="paragraph">
+                <div class="english">{english}</div>
+                <div class="arabic">{arabic}</div>
+            </div>
+            """
         )
-        results.append(translated)
 
-    return "\n\n".join(results)
-
-
-# ==========================================
-# CREATE BILINGUAL PDF
-# ==========================================
-
-def estimate_translation_height(text, page_width):
-    usable_width = max(page_width - 70, 200)
-    chars_per_line = max(25, int(usable_width / 7.5))
-
-    lines = 0
-    for paragraph in text.splitlines():
-        if paragraph.strip():
-            lines += max(
-                1,
-                math.ceil(len(paragraph) / chars_per_line)
-            )
-        else:
-            lines += 1
-
-    return max(150, min(2500, 85 + lines * 19))
-
-
-def add_translation_page(output_doc, source_doc, page_index, translated):
-    original_page = source_doc[page_index]
-    width = original_page.rect.width
-    height = original_page.rect.height
-
-    translation_height = estimate_translation_height(
-        translated,
-        width,
-    )
-
-    new_page = output_doc.new_page(
-        width=width,
-        height=height + translation_height,
-    )
-
-    translation_rect = fitz.Rect(
-        30,
-        25,
-        width - 30,
-        translation_height - 20,
-    )
-
-    html = f"""
-    <div dir="rtl" style="
-        font-family: sans-serif;
-        text-align: right;
-        font-size: 11pt;
-        line-height: 1.6;
-        color: #111111;
-    ">
-        <h2 style="text-align:center; font-size:15pt;">
-            الترجمة العربية
-        </h2>
-        {''.join(
-            '<p>' + paragraph.replace('&', '&amp;')
-            .replace('<', '&lt;')
-            .replace('>', '&gt;') + '</p>'
-            for paragraph in translated.splitlines()
-            if paragraph.strip()
-        )}
-    </div>
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+    </head>
+    <body>
+        <h1 class="heading">Bilingual Lecture / المحاضرة المترجمة</h1>
+        {''.join(parts)}
+    </body>
+    </html>
     """
 
-    new_page.insert_htmlbox(
-        translation_rect,
-        html,
-        css="p { margin: 3px 0; }",
-        scale_low=0.5,
+
+# =========================
+# إنشاء صفحات الترجمة
+# =========================
+
+def create_bilingual_pdf(source_path, translated_path):
+    """إنشاء صفحات ثنائية اللغة مع تقسيم تلقائي للصفحات."""
+
+    source = fitz.open(source_path)
+
+    writer = fitz.DocumentWriter(translated_path)
+
+    page_width = 595
+    page_height = 842
+
+    page_rect = fitz.Rect(0, 0, page_width, page_height)
+    content_rect = fitz.Rect(42, 42, page_width - 42, page_height - 42)
+
+    css = """
+    body {
+        font-family: sans-serif;
+        font-size: 11pt;
+        line-height: 1.45;
+        color: #111111;
+    }
+
+    .heading {
+        font-size: 17pt;
+        text-align: center;
+        margin-bottom: 22pt;
+        color: #222222;
+    }
+
+    .paragraph {
+        margin-bottom: 18pt;
+        padding-bottom: 8pt;
+        border-bottom: 0.5pt solid #dddddd;
+    }
+
+    .english {
+        color: #000000;
+        font-size: 11pt;
+        text-align: left;
+        direction: ltr;
+        margin-bottom: 8pt;
+        white-space: pre-wrap;
+    }
+
+    .arabic {
+        color: #d00000;
+        font-size: 13pt;
+        text-align: right;
+        direction: rtl;
+        margin-bottom: 4pt;
+        white-space: pre-wrap;
+    }
+    """
+
+    try:
+        for page_number, page in enumerate(source, start=1):
+            blocks = extract_blocks(page)
+
+            if not blocks:
+                blocks = [{"text": "(No extractable text on this page)"}]
+
+            html_content = make_bilingual_html(blocks)
+
+            story = fitz.Story(
+                html=html_content,
+                user_css=css,
+            )
+
+            more = True
+
+            while more:
+                device = writer.begin_page(page_rect)
+                more = story.place(content_rect)
+                story.draw(device)
+                writer.end_page()
+
+            logger.info(
+                "Translated page %s of %s",
+                page_number,
+                len(source),
+            )
+
+    finally:
+        writer.close()
+        source.close()
+
+
+# =========================
+# دمج الترجمة مع الأصل
+# =========================
+
+def merge_pdfs(translated_path, source_path, output_path):
+    """صفحات الترجمة أولاً ثم صفحات المحاضرة الأصلية."""
+
+    translated = fitz.open(translated_path)
+    original = fitz.open(source_path)
+    output = fitz.open()
+
+    output.insert_pdf(translated)
+    output.insert_pdf(original)
+
+    output.save(output_path, garbage=4, deflate=True)
+
+    output.close()
+    translated.close()
+    original.close()
+
+
+# =========================
+# أوامر البوت
+# =========================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "أهلاً بيك! 📚\n\n"
+        "أرسل ملف محاضرة بصيغة PDF.\n"
+        "راح أترجم النص الإنكليزي إلى العربية، "
+        "وأضع الترجمة الحمراء تحت كل فقرة إنكليزية، "
+        "وبعدها أرفق صفحات المحاضرة الأصلية."
     )
 
-    original_rect = fitz.Rect(
-        0,
-        translation_height,
-        width,
-        translation_height + height,
-    )
 
-    new_page.show_pdf_page(
-        original_rect,
-        source_doc,
-        page_index,
-    )
-
-
-# ==========================================
-# DOCUMENT HANDLER
-# ==========================================
-
-async def handle_document(
+async def handle_pdf(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    message = update.effective_message
+    message = update.message
     document = message.document
 
-    if not document:
+    if not document or not document.file_name.lower().endswith(".pdf"):
+        await message.reply_text("أرسل ملف PDF فقط.")
         return
 
-    filename = document.file_name or "lecture.pdf"
-
-    if not filename.lower().endswith(".pdf"):
-        await message.reply_text("❌ أرسل ملف PDF فقط.")
-        return
-
-    progress = await message.reply_text(
-        "📥 استلمت المحاضرة.\n"
-        "جاري قراءة الصفحات واستخراج النص..."
+    status = await message.reply_text(
+        "📥 استلمت المحاضرة، دا أجهزها وأترجمها...\n"
+        "قد يستغرق هذا بعض الوقت حسب عدد الصفحات."
     )
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
-            input_path = os.path.join(temp_dir, "input.pdf")
-            output_path = os.path.join(temp_dir, "translated.pdf")
+            source_path = os.path.join(temp_dir, "source.pdf")
+            translated_path = os.path.join(temp_dir, "translated.pdf")
+            output_path = os.path.join(temp_dir, "bilingual_lecture.pdf")
 
-            telegram_file = await document.get_file()
-            await telegram_file.download_to_drive(input_path)
+            tg_file = await context.bot.get_file(document.file_id)
+            await tg_file.download_to_drive(source_path)
 
-            source_doc = fitz.open(input_path)
-            output_doc = fitz.open()
+            # فحص الملف
+            pdf = fitz.open(source_path)
+            page_count = len(pdf)
+            pdf.close()
 
-            total_pages = len(source_doc)
+            if page_count == 0:
+                await status.edit_text("الملف فارغ.")
+                return
 
-            for index, page in enumerate(source_doc):
-                page_text = page.get_text("text").strip()
+            await status.edit_text(
+                f"📖 عدد الصفحات: {page_count}\n"
+                "جاري استخراج النصوص وترجمتها..."
+            )
 
-                if not page_text:
-                    translated = (
-                        "لم يتم العثور على نص قابل للاستخراج "
-                        "في هذه الصفحة. قد تكون الصفحة صورة "
-                        "وتحتاج إلى OCR."
-                    )
-                else:
-                    translated = await translate_text(page_text)
+            # تشغيل المعالجة الثقيلة خارج حلقة البوت
+            await asyncio.to_thread(
+                create_bilingual_pdf,
+                source_path,
+                translated_path,
+            )
 
-                add_translation_page(
-                    output_doc,
-                    source_doc,
-                    index,
-                    translated,
-                )
+            await asyncio.to_thread(
+                merge_pdfs,
+                translated_path,
+                source_path,
+                output_path,
+            )
 
-                await progress.edit_text(
-                    "⏳ جاري ترجمة المحاضرة...\n\n"
-                    f"تمت معالجة الصفحة {index + 1} "
-                    f"من {total_pages}."
-                )
+            await status.edit_text("📤 اكتملت الترجمة، جاري إرسال الملف...")
 
-            output_doc.save(output_path)
-            output_doc.close()
-            source_doc.close()
-
-            with open(output_path, "rb") as result_file:
+            with open(output_path, "rb") as file:
                 await message.reply_document(
-                    document=result_file,
-                    filename=f"Translated_{Path(filename).stem}.pdf",
+                    document=file,
+                    filename="Bilingual_Lecture.pdf",
                     caption=(
-                        "✅ اكتملت ترجمة المحاضرة!\n"
-                        "📄 الترجمة العربية بالأعلى "
-                        "والصفحة الأصلية بالأسفل."
+                        "✅ اكتملت المحاضرة!\n\n"
+                        "الإنكليزي بالأسود، والترجمة العربية بالأحمر، "
+                        "وصفحات المحاضرة الأصلية مرفقة في نهاية الملف."
                     ),
                 )
 
-            await progress.edit_text(
-                "✅ تمت ترجمة المحاضرة وإرسال ملف PDF."
-            )
+            await status.delete()
 
     except Exception as e:
-        logger.exception("PDF translation failed")
-        await progress.edit_text(
-            "❌ حدث خطأ أثناء ترجمة الملف.\n\n"
-            f"{str(e)[:2500]}"
+        logger.exception("PDF processing failed")
+        await status.edit_text(
+            "❌ صار خطأ أثناء معالجة الملف.\n"
+            f"التفاصيل: {str(e)[:800]}"
         )
 
 
-# ==========================================
-# MAIN
-# ==========================================
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await update.message.reply_text(
+        "طريقة الاستخدام:\n"
+        "1. أرسل ملف PDF.\n"
+        "2. انتظر اكتمال الترجمة.\n"
+        "3. استلم الملف الثنائي اللغة."
+    )
+
+
+# =========================
+# تشغيل البوت
+# =========================
 
 def main():
-    application = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .build()
-    )
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    application.add_handler(
-        CommandHandler("start", start)
-    )
-
-    application.add_handler(
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(
         MessageHandler(
             filters.Document.ALL,
-            handle_document,
+            handle_pdf,
         )
     )
 
-    logger.info("PDF translation bot started")
-    application.run_polling()
+    logger.info("Bot is running...")
+    app.run_polling()
 
 
 if __name__ == "__main__":
