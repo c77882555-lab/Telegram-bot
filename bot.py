@@ -1,5 +1,5 @@
+
 import os
-import re
 import asyncio
 import logging
 import tempfile
@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 
 import fitz
-from google import genai
+from groq import Groq
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -28,15 +28,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-MODEL_NAME = "gemini-3.8-flash"
+MODEL_NAME = "llama-3.3-70b-versatile"
 CHUNK_SIZE = 6000
 
-if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-    raise RuntimeError("Missing TELEGRAM_TOKEN or GEMINI_API_KEY")
+if not TELEGRAM_TOKEN or not GROQ_API_KEY:
+    raise RuntimeError("Missing TELEGRAM_TOKEN or GROQ_API_KEY")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+client = Groq(api_key=GROQ_API_KEY)
 
 
 # ==========================================
@@ -100,7 +100,7 @@ def split_text(text, max_chars=CHUNK_SIZE):
 
 
 # ==========================================
-# GEMINI TRANSLATION
+# GROQ TRANSLATION
 # ==========================================
 
 def translate_chunk(text, part, total):
@@ -122,14 +122,21 @@ def translate_chunk(text, part, total):
 {text}
 """
 
-    response = client.models.generate_content(
+    response = client.chat.completions.create(
         model=MODEL_NAME,
-        contents=prompt,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        temperature=0,
     )
 
-    result = response.text
+    result = response.choices[0].message.content
+
     if not result or not result.strip():
-        raise ValueError("Empty Gemini response")
+        raise ValueError("Empty Groq response")
 
     return result.strip()
 
@@ -159,10 +166,6 @@ async def translate_text(text):
 # ==========================================
 
 def estimate_translation_height(text, page_width):
-    """
-    Estimate the space needed for the Arabic translation.
-    The original page will be placed below this area.
-    """
     usable_width = max(page_width - 70, 200)
     chars_per_line = max(25, int(usable_width / 7.5))
 
@@ -189,13 +192,11 @@ def add_translation_page(output_doc, source_doc, page_index, translated):
         width,
     )
 
-    # Create a taller page: translation above, original below.
     new_page = output_doc.new_page(
         width=width,
         height=height + translation_height,
     )
 
-    # Arabic translation area.
     translation_rect = fitz.Rect(
         30,
         25,
@@ -231,7 +232,6 @@ def add_translation_page(output_doc, source_doc, page_index, translated):
         scale_low=0.5,
     )
 
-    # Insert original page unchanged below the translation.
     original_rect = fitz.Rect(
         0,
         translation_height,
@@ -263,9 +263,7 @@ async def handle_document(
     filename = document.file_name or "lecture.pdf"
 
     if not filename.lower().endswith(".pdf"):
-        await message.reply_text(
-            "❌ أرسل ملف PDF فقط."
-        )
+        await message.reply_text("❌ أرسل ملف PDF فقط.")
         return
 
     progress = await message.reply_text(
@@ -330,11 +328,11 @@ async def handle_document(
                 "✅ تمت ترجمة المحاضرة وإرسال ملف PDF."
             )
 
-    except Exception:
+    except Exception as e:
         logger.exception("PDF translation failed")
         await progress.edit_text(
-            "❌ حدث خطأ أثناء ترجمة الملف.\n"
-            "تحقق من إعدادات Gemini API وحاول مرة أخرى."
+            "❌ حدث خطأ أثناء ترجمة الملف.\n\n"
+            f"{str(e)[:2500]}"
         )
 
 
