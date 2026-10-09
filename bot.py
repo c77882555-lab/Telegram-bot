@@ -5,9 +5,9 @@ import logging
 import time
 
 import fitz
+import requests
 import arabic_reshaper
 from bidi.algorithm import get_display
-from deep_translator import GoogleTranslator
 
 from telegram import Update
 from telegram.ext import (
@@ -19,7 +19,7 @@ from telegram.ext import (
 )
 
 # ==========================================
-# 1. إعدادات البوت
+# 1. الإعدادات
 # ==========================================
 
 BOT_TOKEN = (
@@ -28,77 +28,111 @@ BOT_TOKEN = (
     or os.getenv("TELEGRAM_BOT_TOKEN")
 )
 
+DEEPL_AUTH_KEY = os.getenv("DEEPL_AUTH_KEY")
+
 ARABIC_FONT = os.getenv(
     "ARABIC_FONT",
-    "NotoNaskhArabic-Regular.ttf"
+    "NotoNaskhArabic-Regular.ttf",
 )
 
 BATCH_SIZE = 4
+FONT_SIZE = 12.0
+
+DEEPL_URL = "https://api-free.deepl.com/v2/translate"
 
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "Missing TELEGRAM_TOKEN, BOT_TOKEN or TELEGRAM_BOT_TOKEN"
-    )
+    raise RuntimeError("Missing Telegram bot token.")
+
+if not DEEPL_AUTH_KEY:
+    raise RuntimeError("Missing DEEPL_AUTH_KEY environment variable.")
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
-
 logger = logging.getLogger(__name__)
 
 
 # ==========================================
-# 2. الترجمة الإنجليزية إلى العربية
+# 2. DeepL API
 # ==========================================
 
-def translate_text(text: str) -> str:
-    text = (text or "").strip()
+def translate_batch(texts):
+    texts = [text.strip() for text in texts if text and text.strip()]
 
-    if not text:
-        return ""
+    if not texts:
+        return []
 
     last_error = None
 
     for attempt in range(3):
         try:
-            result = GoogleTranslator(
-                source="en",
-                target="ar",
-            ).translate(text)
+            # إرسال عدة فقرات بطلب واحد لتقليل عدد الطلبات
+            payload = [
+                ("text", text)
+                for text in texts
+            ]
+            payload.extend([
+                ("source_lang", "EN"),
+                ("target_lang", "AR"),
+            ])
 
-            if result and result.strip():
-                return result.strip()
+            response = requests.post(
+                DEEPL_URL,
+                headers={
+                    "Authorization": f"DeepL-Auth-Key {DEEPL_AUTH_KEY}",
+                },
+                data=payload,
+                timeout=60,
+            )
 
-            raise RuntimeError("Translation returned an empty result.")
+            if response.status_code == 429:
+                raise RuntimeError(
+                    "DeepL rate limit reached. Try again later."
+                )
+
+            response.raise_for_status()
+            data = response.json()
+
+            translations = data.get("translations", [])
+
+            if len(translations) != len(texts):
+                raise RuntimeError(
+                    "DeepL returned an unexpected number of translations."
+                )
+
+            return [
+                item["text"].strip()
+                for item in translations
+            ]
 
         except Exception as error:
             last_error = error
             logger.warning(
-                "Translation attempt %s failed: %s",
+                "DeepL attempt %s failed: %s",
                 attempt + 1,
                 error,
             )
 
             if attempt < 2:
-                time.sleep(2 * (attempt + 1))
+                time.sleep(2 ** (attempt + 1))
 
     raise RuntimeError(
-        f"Translation failed after 3 attempts: {last_error}"
+        f"DeepL translation failed: {last_error}"
     )
 
 
-def translate_batch(texts):
-    results = []
+def translate_text(text):
+    text = (text or "").strip()
 
-    for text in texts:
-        results.append(translate_text(text))
+    if not text:
+        return ""
 
-    return results
+    return translate_batch([text])[0]
 
 
 # ==========================================
-# 3. استخراج النصوص ومواقعها من PDF
+# 3. استخراج النصوص من PDF
 # ==========================================
 
 def extract_blocks(page):
@@ -146,26 +180,25 @@ async def translate_document(source_path, status):
             for page in pdf
         ]
 
-    total_paragraphs = sum(
-        len(blocks) for blocks in all_blocks
-    )
+    total_blocks = sum(len(blocks) for blocks in all_blocks)
 
-    if total_paragraphs == 0:
+    if total_blocks == 0:
         raise ValueError(
-            "ما لكيت نص قابل للاستخراج من الملف. "
-            "يمكن المحاضرة عبارة عن صور ممسوحة ضوئياً."
+            "لم يتم العثور على نص قابل للاستخراج. "
+            "قد يكون الملف ممسوحاً ضوئياً ويحتاج OCR."
         )
 
     completed = 0
 
-    for page_index, blocks in enumerate(all_blocks, start=1):
-        translated_blocks = []
+    for page_number, blocks in enumerate(all_blocks, start=1):
+        page_translations = []
 
         for start in range(0, len(blocks), BATCH_SIZE):
             batch = blocks[start:start + BATCH_SIZE]
 
             english_texts = [
-                block["text"] for block in batch
+                block["text"]
+                for block in batch
             ]
 
             arabic_texts = await asyncio.to_thread(
@@ -174,7 +207,7 @@ async def translate_document(source_path, status):
             )
 
             for block, arabic in zip(batch, arabic_texts):
-                translated_blocks.append({
+                page_translations.append({
                     "english": block["text"],
                     "arabic": arabic,
                     "bbox": block["bbox"],
@@ -185,21 +218,19 @@ async def translate_document(source_path, status):
             try:
                 await status.edit_text(
                     "🌐 جاري ترجمة المحاضرة...\n\n"
-                    f"📄 الصفحة: {page_index}/{total_pages}\n"
-                    f"📝 الفقرات: {completed}/{total_paragraphs}"
+                    f"📄 الصفحة: {page_number}/{total_pages}\n"
+                    f"📝 الفقرات: {completed}/{total_blocks}"
                 )
             except Exception:
-                logger.warning(
-                    "Could not update progress message."
-                )
+                logger.warning("Could not update progress message.")
 
-        translated_pages.append(translated_blocks)
+        translated_pages.append(page_translations)
 
     return translated_pages
 
 
 # ==========================================
-# 4. تنسيق النص العربي
+# 4. تجهيز النص العربي
 # ==========================================
 
 def prepare_arabic(text):
@@ -273,23 +304,21 @@ def create_bilingual_pdf(
                 "عدد الصفحات الأصلية لا يطابق صفحات الترجمة."
             )
 
-        font_size = 12.0
         margin_x = 28
-        gap_before_translation = 3
-        gap_after_translation = 8
-        line_height = font_size * 1.8
+        gap_before = 3
+        gap_after = 8
+        line_height = FONT_SIZE * 1.8
 
         font = fitz.Font(fontfile=ARABIC_FONT)
 
         for page_index, source_page in enumerate(original):
-            page_rect = source_page.rect
-            page_width = page_rect.width
-            page_height = page_rect.height
+            page_width = source_page.rect.width
+            page_height = source_page.rect.height
+            blocks = translated_pages[page_index]
 
-            page_blocks = translated_pages[page_index]
             candidates = []
 
-            for item in page_blocks:
+            for item in blocks:
                 arabic = (item.get("arabic") or "").strip()
                 bbox = item.get("bbox")
 
@@ -305,20 +334,18 @@ def create_bilingual_pdf(
                 lines = wrap_arabic(
                     arabic,
                     font,
-                    font_size,
+                    FONT_SIZE,
                     page_width - 2 * margin_x,
                 )
 
-                text_height = (
-                    max(1, len(lines)) * line_height + 6
-                )
+                height = max(1, len(lines)) * line_height + 6
 
                 candidates.append({
                     "y0": max(0, y0),
                     "y1": y1,
-                    "arabic": arabic,
                     "lines": lines,
-                    "height": text_height,
+                    "arabic": arabic,
+                    "height": height,
                 })
 
             candidates.sort(
@@ -346,34 +373,29 @@ def create_bilingual_pdf(
             filtered_groups = []
 
             for group in groups:
-                valid_items = [
+                valid = [
                     item
                     for item in group["items"]
                     if len(item["arabic"]) >= 2
                 ]
 
-                if valid_items:
-                    group["items"] = valid_items
+                if valid:
+                    group["items"] = valid
+                    group["strip_height"] = (
+                        gap_before
+                        + sum(item["height"] for item in valid)
+                        + gap_after
+                    )
                     filtered_groups.append(group)
 
-            for group in filtered_groups:
-                group["strip_height"] = (
-                    gap_before_translation
-                    + sum(
-                        item["height"]
-                        for item in group["items"]
-                    )
-                    + gap_after_translation
-                )
-
-            total_extra = sum(
+            extra_height = sum(
                 group["strip_height"]
                 for group in filtered_groups
             )
 
             new_page = output.new_page(
                 width=page_width,
-                height=page_height + total_extra,
+                height=page_height + extra_height,
             )
 
             new_page.insert_font(
@@ -402,7 +424,7 @@ def create_bilingual_pdf(
                         0,
                         target_cursor,
                         page_width,
-                        target_cursor + (cut_y - source_cursor),
+                        target_cursor + cut_y - source_cursor,
                     )
 
                     new_page.show_pdf_page(
@@ -410,22 +432,21 @@ def create_bilingual_pdf(
                         original,
                         page_index,
                         clip=source_clip,
-                        overlay=True,
                     )
 
                     target_cursor += cut_y - source_cursor
                     source_cursor = cut_y
 
-                target_cursor += gap_before_translation
+                target_cursor += gap_before
 
                 for item in group["items"]:
-                    block_height = item["height"]
+                    height = item["height"]
 
-                    translation_rect = fitz.Rect(
+                    rect = fitz.Rect(
                         margin_x,
                         target_cursor,
                         page_width - margin_x,
-                        target_cursor + block_height,
+                        target_cursor + height,
                     )
 
                     shaped = "\n".join(
@@ -434,19 +455,18 @@ def create_bilingual_pdf(
                     )
 
                     new_page.insert_textbox(
-                        translation_rect,
+                        rect,
                         shaped,
                         fontname="arabic",
-                        fontsize=font_size,
+                        fontsize=FONT_SIZE,
                         color=(0.82, 0.0, 0.0),
                         align=fitz.TEXT_ALIGN_RIGHT,
                         lineheight=1.3,
-                        overlay=True,
                     )
 
-                    target_cursor += block_height
+                    target_cursor += height
 
-                target_cursor += gap_after_translation
+                target_cursor += gap_after
 
             if source_cursor < page_height:
                 source_clip = fitz.Rect(
@@ -460,7 +480,7 @@ def create_bilingual_pdf(
                     0,
                     target_cursor,
                     page_width,
-                    target_cursor + (page_height - source_cursor),
+                    target_cursor + page_height - source_cursor,
                 )
 
                 new_page.show_pdf_page(
@@ -468,7 +488,6 @@ def create_bilingual_pdf(
                     original,
                     page_index,
                     clip=source_clip,
-                    overlay=True,
                 )
 
             logger.info(
@@ -488,7 +507,7 @@ def create_bilingual_pdf(
         original.close()
 
     if (
-        not os.path.exists(translated_path)
+        not os.path.isfile(translated_path)
         or os.path.getsize(translated_path) == 0
     ):
         raise ValueError("لم يتم إنشاء ملف PDF صالح.")
@@ -549,10 +568,7 @@ async def handle_pdf(
 
             await status.edit_text("📥 جاري تنزيل ملف PDF...")
 
-            tg_file = await context.bot.get_file(
-                document.file_id
-            )
-
+            tg_file = await context.bot.get_file(document.file_id)
             await tg_file.download_to_drive(source_path)
 
             with fitz.open(source_path) as pdf:
@@ -563,7 +579,7 @@ async def handle_pdf(
 
             await status.edit_text(
                 f"📖 عدد الصفحات: {page_count}\n"
-                "🌐 جاري استخراج النصوص وترجمتها..."
+                "🌐 جاري ترجمة المحاضرة..."
             )
 
             translated_pages = await translate_document(
@@ -572,8 +588,7 @@ async def handle_pdf(
             )
 
             await status.edit_text(
-                "📝 اكتملت الترجمة!\n"
-                "جاري إنشاء ملف PDF..."
+                "📝 اكتملت الترجمة!\nجاري إنشاء PDF..."
             )
 
             await asyncio.to_thread(
@@ -583,10 +598,7 @@ async def handle_pdf(
                 translated_path,
             )
 
-            await status.edit_text(
-                "✅ اكتملت المعالجة!\n"
-                "جاري إرسال الملف..."
-            )
+            await status.edit_text("📤 جاري إرسال الملف...")
 
             with open(translated_path, "rb") as file:
                 await context.bot.send_document(
@@ -595,8 +607,8 @@ async def handle_pdf(
                     filename="Bilingual_Lecture.pdf",
                     caption=(
                         "✅ تمت معالجة المحاضرة!\n"
-                        "أُضيفت الترجمة العربية الحمراء "
-                        "تحت الفقرات الإنكليزية قدر الإمكان."
+                        "الترجمة العربية باللون الأحمر "
+                        "تحت الفقرات الإنجليزية قدر الإمكان."
                     ),
                     connect_timeout=30,
                     read_timeout=180,
@@ -607,16 +619,11 @@ async def handle_pdf(
             await status.delete()
 
     except Exception as error:
-        logger.exception(
-            "PDF processing failed: %s",
-            error,
-        )
-
-        error_text = str(error)[:700]
+        logger.exception("PDF processing failed: %s", error)
 
         user_error = (
-            "❌ صار خطأ أثناء الترجمة أو معالجة الملف.\n\n"
-            + error_text
+            "❌ حدث خطأ أثناء معالجة الملف.\n\n"
+            + str(error)[:700]
         )
 
         try:
@@ -647,10 +654,7 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
 
     app.add_handler(
-        MessageHandler(
-            filters.Document.ALL,
-            handle_pdf,
-        )
+        MessageHandler(filters.Document.ALL, handle_pdf)
     )
 
     app.add_error_handler(error_handler)
