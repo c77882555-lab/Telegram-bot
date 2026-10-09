@@ -2,12 +2,12 @@ import os
 import asyncio
 import tempfile
 import logging
+import time
 
 import fitz
 import arabic_reshaper
 from bidi.algorithm import get_display
-import argostranslate.package
-import argostranslate.translate
+from deep_translator import GoogleTranslator
 
 from telegram import Update
 from telegram.ext import (
@@ -28,78 +28,77 @@ BOT_TOKEN = (
     or os.getenv("TELEGRAM_BOT_TOKEN")
 )
 
+ARABIC_FONT = os.getenv(
+    "ARABIC_FONT",
+    "NotoNaskhArabic-Regular.ttf"
+)
+
 BATCH_SIZE = 4
-ARABIC_FONT = os.getenv("ARABIC_FONT", "NotoNaskhArabic-Regular.ttf")
 
 if not BOT_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_TOKEN (or BOT_TOKEN)")
+    raise RuntimeError(
+        "Missing TELEGRAM_TOKEN, BOT_TOKEN or TELEGRAM_BOT_TOKEN"
+    )
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
+
 logger = logging.getLogger(__name__)
 
 
 # ==========================================
-# 2. إعداد محرك Argos Translate
+# 2. الترجمة الإنجليزية إلى العربية
 # ==========================================
-
-def setup_argos():
-    """يتأكد من وجود نموذج الترجمة من الإنكليزية إلى العربية، وينزّله عند الحاجة."""
-    installed = argostranslate.translate.get_installed_languages()
-
-    en = next((lang for lang in installed if lang.code == "en"), None)
-    ar = next((lang for lang in installed if lang.code == "ar"), None)
-
-    if en and ar:
-        try:
-            en.get_translation(ar)
-            logger.info("English-Arabic Argos model is already installed.")
-            return
-        except Exception:
-            pass
-
-    logger.info("Downloading English-Arabic translation model...")
-    packages = argostranslate.package.get_available_packages()
-
-    package = next(
-        (
-            item for item in packages
-            if item.from_code == "en" and item.to_code == "ar"
-        ),
-        None,
-    )
-
-    if package is None:
-        raise RuntimeError(
-            "لم يتم العثور على نموذج ترجمة من الإنكليزية إلى العربية."
-        )
-
-    package_path = package.download()
-    argostranslate.package.install_from_path(package_path)
-    logger.info("English-Arabic Argos model installed.")
-
 
 def translate_text(text: str) -> str:
     text = (text or "").strip()
+
     if not text:
         return ""
 
-    result = argostranslate.translate.translate(text, "en", "ar")
+    last_error = None
 
-    if not result or not result.strip():
-        raise RuntimeError("Argos Translate returned an empty translation.")
+    for attempt in range(3):
+        try:
+            result = GoogleTranslator(
+                source="en",
+                target="ar",
+            ).translate(text)
 
-    return result.strip()
+            if result and result.strip():
+                return result.strip()
+
+            raise RuntimeError("Translation returned an empty result.")
+
+        except Exception as error:
+            last_error = error
+            logger.warning(
+                "Translation attempt %s failed: %s",
+                attempt + 1,
+                error,
+            )
+
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+
+    raise RuntimeError(
+        f"Translation failed after 3 attempts: {last_error}"
+    )
 
 
 def translate_batch(texts):
-    return [translate_text(text) for text in texts]
+    results = []
+
+    for text in texts:
+        results.append(translate_text(text))
+
+    return results
 
 
 # ==========================================
-# 3. استخراج الفقرات مع مواقعها
+# 3. استخراج النصوص ومواقعها من PDF
 # ==========================================
 
 def extract_blocks(page):
@@ -111,14 +110,17 @@ def extract_blocks(page):
             continue
 
         text = block[4]
+
         if not isinstance(text, str):
             continue
 
         text = text.strip()
+
         if not text:
             continue
 
         x0, y0, x1, y1 = map(float, block[:4])
+
         if x1 <= x0 or y1 <= y0:
             continue
 
@@ -135,11 +137,19 @@ async def translate_document(source_path, status):
 
     with fitz.open(source_path) as pdf:
         total_pages = len(pdf)
+
         if total_pages == 0:
             raise ValueError("ملف PDF فارغ.")
-        all_blocks = [extract_blocks(page) for page in pdf]
 
-    total_paragraphs = sum(len(blocks) for blocks in all_blocks)
+        all_blocks = [
+            extract_blocks(page)
+            for page in pdf
+        ]
+
+    total_paragraphs = sum(
+        len(blocks) for blocks in all_blocks
+    )
+
     if total_paragraphs == 0:
         raise ValueError(
             "ما لكيت نص قابل للاستخراج من الملف. "
@@ -153,10 +163,14 @@ async def translate_document(source_path, status):
 
         for start in range(0, len(blocks), BATCH_SIZE):
             batch = blocks[start:start + BATCH_SIZE]
-            english_texts = [block["text"] for block in batch]
+
+            english_texts = [
+                block["text"] for block in batch
+            ]
 
             arabic_texts = await asyncio.to_thread(
-                translate_batch, english_texts
+                translate_batch,
+                english_texts,
             )
 
             for block, arabic in zip(batch, arabic_texts):
@@ -172,10 +186,12 @@ async def translate_document(source_path, status):
                 await status.edit_text(
                     "🌐 جاري ترجمة المحاضرة...\n\n"
                     f"📄 الصفحة: {page_index}/{total_pages}\n"
-                    f"📝 الفقرات المترجمة: {completed}/{total_paragraphs}"
+                    f"📝 الفقرات: {completed}/{total_paragraphs}"
                 )
             except Exception:
-                logger.warning("Could not update progress message.")
+                logger.warning(
+                    "Could not update progress message."
+                )
 
         translated_pages.append(translated_blocks)
 
@@ -183,18 +199,26 @@ async def translate_document(source_path, status):
 
 
 # ==========================================
-# 4. تنسيق العربية
+# 4. تنسيق النص العربي
 # ==========================================
 
 def prepare_arabic(text):
-    text = text.strip()
+    text = (text or "").strip()
+
     if not text:
         return ""
-    return get_display(arabic_reshaper.reshape(text))
+
+    return get_display(
+        arabic_reshaper.reshape(text)
+    )
 
 
-def wrap_arabic_by_width(text, font, fontsize, max_width):
-    words = text.split()
+def wrap_arabic(text, font, fontsize, max_width):
+    words = (text or "").split()
+
+    if not words:
+        return [""]
+
     lines = []
     current = ""
 
@@ -203,15 +227,19 @@ def wrap_arabic_by_width(text, font, fontsize, max_width):
         shaped = prepare_arabic(candidate)
 
         try:
-            candidate_width = font.text_length(shaped, fontsize=fontsize)
+            width = font.text_length(
+                shaped,
+                fontsize=fontsize,
+            )
         except Exception:
-            candidate_width = len(candidate) * fontsize * 0.65
+            width = len(candidate) * fontsize * 0.65
 
-        if candidate_width <= max_width:
+        if width <= max_width:
             current = candidate
         else:
             if current:
                 lines.append(current)
+
             current = word
 
     if current:
@@ -224,12 +252,16 @@ def wrap_arabic_by_width(text, font, fontsize, max_width):
 # 5. إنشاء PDF ثنائي اللغة
 # ==========================================
 
-def create_bilingual_pdf(source_path, translated_pages, translated_path):
+def create_bilingual_pdf(
+    source_path,
+    translated_pages,
+    translated_path,
+):
     if not os.path.isfile(ARABIC_FONT):
         raise FileNotFoundError(
-            f"خط العربية غير موجود: {ARABIC_FONT}\n"
-            "ضع NotoNaskhArabic-Regular.ttf داخل مجلد البوت "
-            "أو عيّن متغير ARABIC_FONT إلى مسار الخط."
+            f"خط العربية غير موجود: {ARABIC_FONT}. "
+            "ضع ملف NotoNaskhArabic-Regular.ttf "
+            "داخل مجلد البوت."
         )
 
     original = fitz.open(source_path)
@@ -237,48 +269,24 @@ def create_bilingual_pdf(source_path, translated_pages, translated_path):
 
     try:
         if len(original) != len(translated_pages):
-            raise ValueError("عدد الصفحات الأصلية لا يطابق عدد صفحات الترجمة.")
+            raise ValueError(
+                "عدد الصفحات الأصلية لا يطابق صفحات الترجمة."
+            )
 
-        font_size = 18.0
+        font_size = 12.0
         margin_x = 28
         gap_before_translation = 3
         gap_after_translation = 8
-        line_height = font_size * 1.9
+        line_height = font_size * 1.8
 
         font = fitz.Font(fontfile=ARABIC_FONT)
-
-        def wrap_arabic(text, max_width):
-            words = (text or "").split()
-            lines = []
-            current = ""
-
-            for word in words:
-                candidate = f"{current} {word}".strip()
-                shaped = prepare_arabic(candidate)
-
-                try:
-                    width = font.text_length(shaped, fontsize=font_size)
-                except Exception:
-                    width = len(candidate) * font_size * 0.65
-
-                if width <= max_width:
-                    current = candidate
-                else:
-                    if current:
-                        lines.append(current)
-                    current = word
-
-            if current:
-                lines.append(current)
-
-            return lines or [""]
 
         for page_index, source_page in enumerate(original):
             page_rect = source_page.rect
             page_width = page_rect.width
             page_height = page_rect.height
-            page_blocks = translated_pages[page_index]
 
+            page_blocks = translated_pages[page_index]
             candidates = []
 
             for item in page_blocks:
@@ -294,33 +302,56 @@ def create_bilingual_pdf(source_path, translated_pages, translated_path):
                 if y1 <= 0:
                     continue
 
-                lines = wrap_arabic(arabic, page_width - 2 * margin_x)
-                text_height = max(1, len(lines)) * line_height + 6
+                lines = wrap_arabic(
+                    arabic,
+                    font,
+                    font_size,
+                    page_width - 2 * margin_x,
+                )
+
+                text_height = (
+                    max(1, len(lines)) * line_height + 6
+                )
 
                 candidates.append({
-                    "y0": max(0, float(y0)),
+                    "y0": max(0, y0),
                     "y1": y1,
                     "arabic": arabic,
                     "lines": lines,
                     "height": text_height,
                 })
 
-            candidates.sort(key=lambda item: (item["y1"], item["y0"]))
+            candidates.sort(
+                key=lambda item: (item["y1"], item["y0"])
+            )
 
             groups = []
+
             for item in candidates:
-                if groups and abs(item["y1"] - groups[-1]["y1"]) <= 3:
+                if (
+                    groups
+                    and abs(item["y1"] - groups[-1]["y1"]) <= 3
+                ):
                     groups[-1]["items"].append(item)
-                    groups[-1]["y1"] = max(groups[-1]["y1"], item["y1"])
+                    groups[-1]["y1"] = max(
+                        groups[-1]["y1"],
+                        item["y1"],
+                    )
                 else:
-                    groups.append({"y1": item["y1"], "items": [item]})
+                    groups.append({
+                        "y1": item["y1"],
+                        "items": [item],
+                    })
 
             filtered_groups = []
+
             for group in groups:
                 valid_items = [
-                    item for item in group["items"]
-                    if len(item["arabic"]) >= 8
+                    item
+                    for item in group["items"]
+                    if len(item["arabic"]) >= 2
                 ]
+
                 if valid_items:
                     group["items"] = valid_items
                     filtered_groups.append(group)
@@ -328,30 +359,45 @@ def create_bilingual_pdf(source_path, translated_pages, translated_path):
             for group in filtered_groups:
                 group["strip_height"] = (
                     gap_before_translation
-                    + sum(item["height"] for item in group["items"])
+                    + sum(
+                        item["height"]
+                        for item in group["items"]
+                    )
                     + gap_after_translation
                 )
 
             total_extra = sum(
-                group["strip_height"] for group in filtered_groups
+                group["strip_height"]
+                for group in filtered_groups
             )
 
             new_page = output.new_page(
                 width=page_width,
                 height=page_height + total_extra,
             )
-            new_page.insert_font(fontname="arabic", fontfile=ARABIC_FONT)
+
+            new_page.insert_font(
+                fontname="arabic",
+                fontfile=ARABIC_FONT,
+            )
 
             source_cursor = 0.0
             target_cursor = 0.0
 
             for group in filtered_groups:
-                cut_y = min(max(group["y1"], source_cursor), page_height)
+                cut_y = min(
+                    max(group["y1"], source_cursor),
+                    page_height,
+                )
 
                 if cut_y > source_cursor:
                     source_clip = fitz.Rect(
-                        0, source_cursor, page_width, cut_y
+                        0,
+                        source_cursor,
+                        page_width,
+                        cut_y,
                     )
+
                     target_rect = fitz.Rect(
                         0,
                         target_cursor,
@@ -374,6 +420,7 @@ def create_bilingual_pdf(source_path, translated_pages, translated_path):
 
                 for item in group["items"]:
                     block_height = item["height"]
+
                     translation_rect = fitz.Rect(
                         margin_x,
                         target_cursor,
@@ -382,7 +429,8 @@ def create_bilingual_pdf(source_path, translated_pages, translated_path):
                     )
 
                     shaped = "\n".join(
-                        prepare_arabic(line) for line in item["lines"]
+                        prepare_arabic(line)
+                        for line in item["lines"]
                     )
 
                     new_page.insert_textbox(
@@ -402,8 +450,12 @@ def create_bilingual_pdf(source_path, translated_pages, translated_path):
 
             if source_cursor < page_height:
                 source_clip = fitz.Rect(
-                    0, source_cursor, page_width, page_height
+                    0,
+                    source_cursor,
+                    page_width,
+                    page_height,
                 )
+
                 target_rect = fitz.Rect(
                     0,
                     target_cursor,
@@ -419,15 +471,26 @@ def create_bilingual_pdf(source_path, translated_pages, translated_path):
                     overlay=True,
                 )
 
-            logger.info("Created page %s/%s.", page_index + 1, len(original))
+            logger.info(
+                "Created page %s/%s",
+                page_index + 1,
+                len(original),
+            )
 
-        output.save(translated_path, garbage=4, deflate=True)
+        output.save(
+            translated_path,
+            garbage=4,
+            deflate=True,
+        )
 
     finally:
         output.close()
         original.close()
 
-    if not os.path.exists(translated_path) or os.path.getsize(translated_path) == 0:
+    if (
+        not os.path.exists(translated_path)
+        or os.path.getsize(translated_path) == 0
+    ):
         raise ValueError("لم يتم إنشاء ملف PDF صالح.")
 
 
@@ -439,12 +502,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أهلاً بيك! 📚\n\n"
         "أرسل محاضرتك بصيغة PDF.\n"
-        "راح أضيف الترجمة العربية بالأحمر تحت الفقرات الإنكليزية مباشرةً "
-        "قدر الإمكان، مع الحفاظ على الصفحة الأصلية."
+        "راح أضيف الترجمة العربية باللون الأحمر "
+        "تحت الفقرات الإنكليزية قدر الإمكان."
     )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     await update.message.reply_text(
         "📚 طريقة الاستخدام:\n\n"
         "1. أرسل ملف PDF.\n"
@@ -453,7 +519,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_pdf(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     message = update.message
     document = message.document
 
@@ -461,19 +530,29 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     filename = document.file_name or "lecture.pdf"
+
     if not filename.lower().endswith(".pdf"):
         await message.reply_text("❌ أرسل ملف PDF فقط.")
         return
 
-    status = await message.reply_text("📥 استلمت المحاضرة!\nجاري تجهيز الملف...")
+    status = await message.reply_text(
+        "📥 استلمت المحاضرة!\nجاري تجهيز الملف..."
+    )
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             source_path = os.path.join(temp_dir, "source.pdf")
-            translated_path = os.path.join(temp_dir, "bilingual_lecture.pdf")
+            translated_path = os.path.join(
+                temp_dir,
+                "bilingual_lecture.pdf",
+            )
 
             await status.edit_text("📥 جاري تنزيل ملف PDF...")
-            tg_file = await context.bot.get_file(document.file_id)
+
+            tg_file = await context.bot.get_file(
+                document.file_id
+            )
+
             await tg_file.download_to_drive(source_path)
 
             with fitz.open(source_path) as pdf:
@@ -487,9 +566,16 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🌐 جاري استخراج النصوص وترجمتها..."
             )
 
-            translated_pages = await translate_document(source_path, status)
+            translated_pages = await translate_document(
+                source_path,
+                status,
+            )
 
-            await status.edit_text("📝 اكتملت الترجمة!\nجاري إنشاء ملف PDF...")
+            await status.edit_text(
+                "📝 اكتملت الترجمة!\n"
+                "جاري إنشاء ملف PDF..."
+            )
+
             await asyncio.to_thread(
                 create_bilingual_pdf,
                 source_path,
@@ -497,7 +583,10 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 translated_path,
             )
 
-            await status.edit_text("✅ اكتملت المعالجة!\nجاري إرسال الملف...")
+            await status.edit_text(
+                "✅ اكتملت المعالجة!\n"
+                "جاري إرسال الملف..."
+            )
 
             with open(translated_path, "rb") as file:
                 await context.bot.send_document(
@@ -506,8 +595,8 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     filename="Bilingual_Lecture.pdf",
                     caption=(
                         "✅ تمت معالجة المحاضرة!\n"
-                        "أُضيفت الترجمة الحمراء أسفل الفقرات الإنكليزية "
-                        "قدر الإمكان مع الحفاظ على الصفحة الأصلية."
+                        "أُضيفت الترجمة العربية الحمراء "
+                        "تحت الفقرات الإنكليزية قدر الإمكان."
                     ),
                     connect_timeout=30,
                     read_timeout=180,
@@ -518,10 +607,16 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status.delete()
 
     except Exception as error:
-        logger.exception("PDF processing failed: %s", error)
+        logger.exception(
+            "PDF processing failed: %s",
+            error,
+        )
+
         error_text = str(error)[:700]
+
         user_error = (
-            "❌ صار خطأ أثناء الترجمة أو معالجة الملف.\n\n" + error_text
+            "❌ صار خطأ أثناء الترجمة أو معالجة الملف.\n\n"
+            + error_text
         )
 
         try:
@@ -530,18 +625,34 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text(user_error)
 
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Unhandled error: %s", context.error, exc_info=context.error)
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    logger.error(
+        "Unhandled error: %s",
+        context.error,
+        exc_info=context.error,
+    )
 
+
+# ==========================================
+# 7. تشغيل البوت
+# ==========================================
 
 def main():
-    # تنزيل وتثبيت نموذج الترجمة عند تشغيل البوت لأول مرة
-    setup_argos()
-
     app = Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_pdf))
+
+    app.add_handler(
+        MessageHandler(
+            filters.Document.ALL,
+            handle_pdf,
+        )
+    )
+
     app.add_error_handler(error_handler)
 
     logger.info("Bot is running...")
@@ -549,5 +660,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
     main()
